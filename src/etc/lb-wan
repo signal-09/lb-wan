@@ -1,0 +1,8 @@
+# Indicates how often to check the ping host for each ISP in seconds.
+CHECK_INTERVAL=3
+
+# How long ping are allowed to respond before consider unreachable.
+PING_TIMEOUT=2
+
+# Define the maximum packet losses required to declare a link up or down.
+MAX_PACKET_LOSS=5

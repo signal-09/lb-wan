@@ -1,0 +1,52 @@
+# load variables
+[[ -f @sysconfdir@/default/wan-balancer ]] && source @sysconfdir@/default/wan-balancer
+
+# set default values
+: ${CHECK_INTERVAL:=3}
+: ${PING_TIMEOUT:=2}
+: ${MAX_PACKET_LOSS:=5}
+: ${WAN_BALANCER_CONF:='@sysconfdir@/lb-wan.conf'}
+: ${RUN_STATE:='@runstatedir@'}
+
+# load config file
+if [[ -f "$WAN_BALANCER_CONF" ]]; then
+    WAN_CONF=$(grep -vE '^$|^#|^LAN' "$WAN_BALANCER_CONF")
+    if ! [[ "$WAN_CONF" ]]; then
+        echo "ERROR: Config file \`${WAN_BALANCER_CONF}' is empty" 1>&2
+        exit 255
+    fi
+    LAN_INT=$(awk '/^LAN[[:space:]]/{ print $2 }' "$WAN_BALANCER_CONF")
+    [[ "$LAN_INT" ]] && LAN_NET=$(ip route show dev $LAN_INT scope link | awk '{ print $1 }')
+else
+    echo "ERROR: Config file \`${WAN_BALANCER_CONF}' not present" 1>&2
+    exit 255
+fi
+
+# check for packet forwarding
+IP_FORWARD=$(sysctl -n net.ipv4.ip_forward)
+IPTABLES_FORWARD=$(iptables -t filter -S | awk '/^-P FORWARD/{ print $3 }')
+[[ $IP_FORWARD -ne 1 ]] && echo "WARNING: Packet forwarding not enabled" 1>&2
+[[ "$IPTABLES_FORWARD" != 'ACCEPT' ]] && echo "WARNING: Filtered iptables forwarding" 1>&2
+
+
+get_wan_status() {
+    local PROVIDER=${1,,}
+    local STATUS_FILE="${RUN_STATE}/wan_balancer_${PROVIDER}.status"
+
+    if [[ -f "$STATUS_FILE" ]]; then
+        cat "$STATUS_FILE"
+    else
+        echo "$MAX_PACKET_LOSS - DOWN"
+    fi
+}
+
+
+set_wan_status() {
+    local PROVIDER=${1,,}
+    local LOSS=${2:-$MAX_PACKET_LOSS}
+    local RTT=${3:--}
+    local STATE=${4:-DOWN}
+    local STATUS_FILE="${RUN_STATE}/wan_balancer_${PROVIDER}.status"
+
+    echo -e "${LOSS}\t${RTT}\t${STATE}" >"$STATUS_FILE"
+}

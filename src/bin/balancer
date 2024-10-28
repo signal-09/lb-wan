@@ -1,0 +1,65 @@
+#!/bin/bash
+
+set -o pipefail
+
+# load shared components
+DIR=$(dirname -- "${BASH_SOURCE[0]}")
+source "${DIR}/../lib/common.sh"
+
+
+# delete iptables rules on exit
+cleanup() {
+    INTERFACES=$(awk '{ print $2 }' <<<"$WAN_CONF")
+    for INT in $LAN_INT $INTERFACES; do 
+        echo "Cleaning nat for interface ${INT}"
+        iptables -t nat -D POSTROUTING ${LAN_NET:+-s $LAN_NET} -o $INT -j MASQUERADE
+    done
+    exit
+}
+trap cleanup INT TERM
+
+
+init() {
+    if [[ "$LAN_INT" ]]; then
+        sysctl -w net.ipv4.ip_forward=1
+        sysctl -w net.ipv6.conf.all.forwarding=1
+    fi
+
+    INTERFACES=$(awk '{ print $2 }' <<<"$WAN_CONF")
+    for INT in $INTERFACES; do 
+        echo "Natting interface ${INT}${LAN_NET:+ from $LAN_NET}"
+        iptables -t nat -A POSTROUTING ${LAN_NET:+-s $LAN_NET} -o $INT -j MASQUERADE
+    done
+}
+
+
+get_routes() {
+    while read PROVIDER ETHERNET WEIGHT PING_IPS; do
+        read LOSS RTT STATE < <(get_wan_status "$PROVIDER")
+        if [[ "$STATE" == UP ]]; then
+            GW=$(ip -4 route show default dev ${ETHERNET} table all match default | awk '{ print $3 }' | head -1)
+            [[ "$GW" ]] && echo "nexthop via ${GW} dev ${ETHERNET} weight ${WEIGHT}"
+        fi
+    done <<<"$WAN_CONF"
+}
+
+
+init
+
+while :; do # check forever
+    ROUTES=($(get_routes))
+    NEW_ROUTES="${ROUTES[@]}"
+    NEW_DEFAULT=$(ip route show match default)
+    if [[ "$NEW_ROUTES" != "$OLD_ROUTES" || "$NEW_DEFAULT" != "$OLD_DEFAULT" ]]; then
+        if [[ "$NEW_ROUTES" ]]; then
+            echo "Set default route to $NEW_ROUTES"
+            ip route replace default scope global $NEW_ROUTES
+        else
+            echo "WARNING: no WAN detected, removing default route"
+            ip route delete default scope global
+        fi
+        OLD_ROUTES=$NEW_ROUTES
+        OLD_DEFAULT=$(ip route show match default)
+    fi
+    sleep $CHECK_INTERVAL
+done

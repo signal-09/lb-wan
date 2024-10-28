@@ -1,0 +1,11 @@
+[Unit]
+Description=WAN Monitor
+After=network.target
+
+[Service]
+ExecStart=@bindir@/monitor
+Restart=on-failure
+RestartPreventExitStatus=0 255
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,12 @@
+[Unit]
+Description=Load Balancer for WAN
+After=network.target wan-monitor.service
+Requires=wan-monitor.service
+
+[Service]
+ExecStart=@bindir@/balancer
+Restart=on-failure
+RestartPreventExitStatus=0 255
+
+[Install]
+WantedBy=multi-user.target
