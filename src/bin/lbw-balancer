@@ -1,0 +1,47 @@
+#!/bin/bash
+
+set -o pipefail
+
+# load shared components
+DIR=$(dirname -- "${BASH_SOURCE[0]}")
+source "${DIR}/../lib/common.sh"
+
+
+# delete balanced routes
+cleanup() {
+    ip route delete default scope global
+    exit
+}
+trap cleanup INT TERM
+
+
+get_routes() {
+    while read PROVIDER ETHERNET WEIGHT PING_IPS; do
+        read LOSS RTT STATE < <(get_wan_status "$PROVIDER")
+        if [[ "$STATE" == UP ]]; then
+            GW=$(ip -4 route show default dev ${ETHERNET} table all match default | awk '{ print $3 }' | head -1)
+            [[ "$GW" ]] && echo "nexthop via ${GW} dev ${ETHERNET} weight ${WEIGHT}"
+        fi
+    done <<<"$WAN_CONF"
+}
+
+
+while sleep $CHECK_INTERVAL; do
+    [[ $(get_lb_status) != "RUNNING" ]] && continue
+
+    ROUTES=($(get_routes))
+    NEW_ROUTES="${ROUTES[@]}"
+    NEW_DEFAULT=$(ip route show default scope global)
+
+    [[ "$NEW_ROUTES" == "$OLD_ROUTES" && "$NEW_DEFAULT" == "$OLD_DEFAULT" ]] && continue
+
+    if [[ "$NEW_ROUTES" ]]; then
+        echo "Set default route to $NEW_ROUTES"
+        ip route replace default scope global $NEW_ROUTES
+    else
+        echo "WARNING: no WAN detected, removing default route"
+        ip route delete default scope global
+    fi
+    OLD_ROUTES=$NEW_ROUTES
+    OLD_DEFAULT=$(ip route show default scope global)
+done

@@ -1,10 +1,10 @@
 [Unit]
 Description=Load Balancer for WAN
-After=network.target wan-monitor.service
-Requires=wan-monitor.service
+After=network.target lbw-monitor.service
+Requires=lbw-monitor.service
 
 [Service]
-ExecStart=@bindir@/balancer
+ExecStart=@bindir@/lbw-balancer
 Restart=on-failure
 RestartPreventExitStatus=0 255
 

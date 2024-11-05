@@ -1,0 +1,134 @@
+#!/bin/bash
+
+set -o pipefail
+
+# load shared components
+DIR=$(dirname -- "${BASH_SOURCE[0]}")
+source "${DIR}/../lib/common.sh"
+
+
+# initialize
+setup() {
+    echo "LOADING" >"${RUN_STATE}/lb-wan.status"
+    setup_vrf_tables
+    migrate_to_vrf
+    forward_and_masq
+    echo "RUNNING" >"${RUN_STATE}/lb-wan.status"
+}
+
+
+# cleanup on exit
+cleanup() {
+    echo "UNLOADING" >"${RUN_STATE}/lb-wan.status"
+    INTERFACES=$(awk '{ print $2 }' <<<"$WAN_CONF")
+    for INT in $LAN_INT $INTERFACES; do
+        echo "Cleaning nat for interface ${INT}"
+        iptables -t nat -D POSTROUTING ${LAN_NET:+-s $LAN_NET} -o $INT -j MASQUERADE
+    done
+    while read PROVIDER ETHERNET WEIGHT PING_IPS; do
+        TABLE_NAME=${PROVIDER,,}
+        for PRIORITY in $(ip rule show lookup "$TABLE_NAME" | awk -F: '{ print $1 }'); do
+            ip rule del priority "$PRIORITY"
+        done
+        if [[ "$LAN_NET" && "$LAN_INT" ]]; then
+            ip route del "$LAN_NET" dev "$LAN_INT" scope link table "$TABLE_NAME"
+        fi
+        ip link set dev "$ETHERNET" nomaster
+        ip link del dev "$TABLE_NAME"
+        ip link set dev "$ETHERNET" down
+        ip addr flush dev "$ETHERNET"
+        RT_TABLE="/etc/iproute2/rt_tables.d/${TABLE_NAME}.conf"
+        [[ -f "$RT_TABLE" ]] && rm -f "$RT_TABLE"
+        #if_up "$ETHERNET"
+    done <<<"$WAN_CONF"
+    ip rule del l3mdev priority 1000
+    sysctl -w net.ipv4.tcp_l3mdev_accept=0
+    sysctl -w net.ipv4.udp_l3mdev_accept=0
+    if [[ "$LAN_INT" ]]; then
+        sysctl -w net.ipv4.ip_forward="$IP_FORWARD"
+        sysctl -w net.ipv6.conf.all.forwarding="$IPV6_FORWARD"
+    fi
+    rm -f "${RUN_STATE}/lb-wan.status"
+    exit
+}
+trap cleanup INT TERM
+
+
+# creat VRF tables
+setup_vrf_tables() {
+    while read PROVIDER ETHERNET WEIGHT PING_IPS; do
+        TABLE_NAME=${PROVIDER,,}
+        if ! grep -wq "${TABLE_NAME}\$" <<<"$RT_TABLES"; then
+            RT_TABLE="/etc/iproute2/rt_tables.d/${TABLE_NAME}.conf"
+            NEW_TABLE=$(next_rt_table)
+            echo -e "${NEW_TABLE}\t${TABLE_NAME}" >"$RT_TABLE"
+            RT_TABLES=$(read_rt_tables)
+        fi
+    done <<<"$WAN_CONF"
+}
+
+
+# enslave interfaces to VRF
+migrate_to_vrf() {
+    ip rule add l3mdev priority 1000
+    while read PROVIDER ETHERNET WEIGHT PING_IPS; do
+        local TABLE_NAME=${PROVIDER,,}
+
+        # shutdown and clear interface
+        if_down "$ETHERNET"
+
+        # create VRF and routing table with same name
+        ip link add dev "$TABLE_NAME" type vrf table "$TABLE_NAME"
+        ip link set dev "$TABLE_NAME" up
+
+        # assign interface to VRF
+        ip link set dev "$ETHERNET" master "$TABLE_NAME"
+        ip link set dev "$ETHERNET" up
+
+        # use lease file as input for local routing
+        local LEASE_FILE="/var/lib/dhcp/dhclient.${ETHERNET}.leases"
+        [[ -f "$LEASE_FILE" ]] && rm "$LEASE_FILE"
+        ip vrf exec "$TABLE_NAME" dhclient -lf "$LEASE_FILE" "$ETHERNET"
+        local LEASE_OPTIONS=$(awk '/option/{ gsub(";", ""); print $2 "=" $3 }' "$LEASE_FILE")
+        local GATEWAY=$(awk -F= '/routers/{ print $2 }' <<<"$LEASE_OPTIONS")
+        ip route add default via "$GATEWAY" dev "$ETHERNET" table "$TABLE_NAME"
+
+        # ensure VRF networks be routable from local network
+        local NETWORKS=$(ip route show dev "$ETHERNET" scope link type unicast table "$TABLE_NAME" | awk '{ print $1 }')
+        for NETWORK in $NETWORKS; do
+            ip rule add to "$NETWORK" table "$TABLE_NAME"
+        done
+
+        # ensure local network be routable from VRF
+        if [[ "$LAN_NET" && "$LAN_INT" ]]; then
+            ip route add "$LAN_NET" dev "$LAN_INT" scope link table "$TABLE_NAME"
+        fi
+    done <<<"$WAN_CONF"
+}
+
+
+# enable IP forwarding and NAT
+forward_and_masq() {
+    sysctl -w net.ipv4.tcp_l3mdev_accept=1
+    sysctl -w net.ipv4.udp_l3mdev_accept=1
+    if [[ "$LAN_INT" ]]; then
+        sysctl -w net.ipv4.ip_forward=1
+        sysctl -w net.ipv6.conf.all.forwarding=1
+    fi
+
+    # masquerade from every interfaces
+    INTERFACES=$(awk '{ print $2 }' <<<"$WAN_CONF")
+    for INT in $LAN_INT $INTERFACES; do
+        echo "Natting interface ${INT}${LAN_NET:+ from $LAN_NET}"
+        local RULE="POSTROUTING ${LAN_NET:+-s $LAN_NET} -o $INT -j MASQUERADE"
+        ( iptables-save -t nat | grep -q -- "$RULE" ) || iptables -t nat -A $RULE
+    done
+}
+
+
+setup
+
+# loop forever
+while sleep infinity; do :; done
+
+cleanup

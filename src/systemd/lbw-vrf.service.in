@@ -1,9 +1,9 @@
 [Unit]
-Description=WAN Monitor
+Description=Load Balancer VRF
 After=network.target
 
 [Service]
-ExecStart=@bindir@/monitor
+ExecStart=@bindir@/lbw-vrf
 Restart=on-failure
 RestartPreventExitStatus=0 255
 

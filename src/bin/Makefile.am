@@ -1,7 +1,7 @@
 all-am: common.sh
 	@touch *.in
 
-dist_bin_SCRIPTS = balancer monitor
+dist_bin_SCRIPTS = lbw-vrf lbw-monitor lbw-balancer
 
 commondir = $(libdir)
 common_DATA = common.sh
@@ -14,4 +14,4 @@ common.sh: common.sh.in
 	@$(edit) $< >$@
 
 clean-local:
-	@-rm $(common_DATA)
+	@-rm -f $(common_DATA)

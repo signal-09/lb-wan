@@ -10,7 +10,7 @@ source "${DIR}/../lib/common.sh"
 # delete status files on exit
 cleanup() {
     while read PROVIDER ETHERNET WEIGHT PING_IPS; do
-        STATUS_FILE="${RUN_STATE}/wan_balancer_${PROVIDER,,}.status"
+        STATUS_FILE="${RUN_STATE}/lb_${PROVIDER,,}.status"
         [[ -f "$STATUS_FILE" ]] && rm -f "$STATUS_FILE"
     done <<<"$WAN_CONF"
     exit
@@ -20,23 +20,22 @@ trap cleanup INT TERM
 
 # ping with ethernet binding and return RTTs if succeded
 rtt_ping() {
-    local LAN=$1
-    local TGT=$2
+    local PROVIDER=$1
+    local TARGET=$2
 
-    ping -4 -q -c1 -n -W${PING_TIMEOUT} -I${LAN} ${TGT} 2>/dev/null | awk -F/ '/^rtt/{ print $5 }'
+    ip vrf exec "${PROVIDER,,}" ping -4 -q -c1 -n -W${PING_TIMEOUT} ${TARGET} 2>/dev/null | awk -F/ '/^rtt/{ print $5 }'
 }
 
 
 # write status file based on reachability
 check_connectivity() {
     local PROVIDER=$1
-    local INT=$2
-    local TARGETS=$3
+    local TARGETS=$2
     local REACHED=false
 
     # check for reachability
     for TGT in ${TARGETS//,/ }; do
-        if RTT=$(rtt_ping ${INT} ${TGT}); then
+        if RTT=$(rtt_ping ${PROVIDER} ${TGT}); then
             REACHED=true
             break
         fi
@@ -71,7 +70,7 @@ check_connectivity() {
 while :; do # check forever
     while read PROVIDER ETHERNET WEIGHT PING_IPS; do
         # asyncronous check
-        check_connectivity $PROVIDER $ETHERNET $PING_IPS &
+        check_connectivity $PROVIDER $PING_IPS &
     done <<<"$WAN_CONF"
     sleep $CHECK_INTERVAL
 done

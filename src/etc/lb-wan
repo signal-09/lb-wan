@@ -6,3 +6,6 @@ PING_TIMEOUT=2
 
 # Define the maximum packet losses required to declare a link up or down.
 MAX_PACKET_LOSS=5
+
+# Network manager (auto|ifupdown|netplan|manual)
+NETWORKING=auto
