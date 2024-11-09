@@ -67,10 +67,9 @@ check_connectivity() {
 }
 
 
-while :; do # check forever
+while sleep $CHECK_INTERVAL; do # check forever
     while read PROVIDER ETHERNET WEIGHT PING_IPS; do
         # asyncronous check
         check_connectivity $PROVIDER $PING_IPS &
     done <<<"$WAN_CONF"
-    sleep $CHECK_INTERVAL
 done

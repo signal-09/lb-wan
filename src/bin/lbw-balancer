@@ -17,10 +17,11 @@ trap cleanup INT TERM
 
 get_routes() {
     while read PROVIDER ETHERNET WEIGHT PING_IPS; do
+        local TABLE_NAME=${PROVIDER,,}
         read LOSS RTT STATE < <(get_wan_status "$PROVIDER")
         if [[ "$STATE" == UP ]]; then
-            GW=$(ip -4 route show default dev ${ETHERNET} table all match default | awk '{ print $3 }' | head -1)
-            [[ "$GW" ]] && echo "nexthop via ${GW} dev ${ETHERNET} weight ${WEIGHT}"
+            local GATEWAY=$(ip -4 route show default dev ${ETHERNET} table "$TABLE_NAME" | awk '{ print $3 }' | head -1)
+            [[ "$GATEWAY" ]] && echo "nexthop via ${GATEWAY} dev ${ETHERNET} weight ${WEIGHT}"
         fi
     done <<<"$WAN_CONF"
 }

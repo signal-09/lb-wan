@@ -6,6 +6,9 @@ set -o pipefail
 DIR=$(dirname -- "${BASH_SOURCE[0]}")
 source "${DIR}/../lib/common.sh"
 
+# store default gateways in dictionary
+declare -A RT_GATEWAY
+
 
 # initialize
 setup() {
@@ -20,24 +23,29 @@ setup() {
 # cleanup on exit
 cleanup() {
     echo "UNLOADING" >"${RUN_STATE}/lb-wan.status"
-    INTERFACES=$(awk '{ print $2 }' <<<"$WAN_CONF")
+    local INTERFACES=$(awk '{ print $2 }' <<<"$WAN_CONF")
     for INT in $LAN_INT $INTERFACES; do
         echo "Cleaning nat for interface ${INT}"
         iptables -t nat -D POSTROUTING ${LAN_NET:+-s $LAN_NET} -o $INT -j MASQUERADE
     done
     while read PROVIDER ETHERNET WEIGHT PING_IPS; do
-        TABLE_NAME=${PROVIDER,,}
+        local TABLE_NAME=${PROVIDER,,}
         for PRIORITY in $(ip rule show lookup "$TABLE_NAME" | awk -F: '{ print $1 }'); do
             ip rule del priority "$PRIORITY"
         done
         if [[ "$LAN_NET" && "$LAN_INT" ]]; then
             ip route del "$LAN_NET" dev "$LAN_INT" scope link table "$TABLE_NAME"
         fi
+        local LEASE_PID="/var/lib/dhcp/dhclient.${ETHERNET}.pid"
+        if [[ -f "$LEASE_PID" ]]; then
+            kill $(cat "$LEASE_PID")
+            rm "$LEASE_PID"
+        fi
         ip link set dev "$ETHERNET" nomaster
         ip link del dev "$TABLE_NAME"
         ip link set dev "$ETHERNET" down
         ip addr flush dev "$ETHERNET"
-        RT_TABLE="/etc/iproute2/rt_tables.d/${TABLE_NAME}.conf"
+        local RT_TABLE="/etc/iproute2/rt_tables.d/${TABLE_NAME}.conf"
         [[ -f "$RT_TABLE" ]] && rm -f "$RT_TABLE"
         #if_up "$ETHERNET"
     done <<<"$WAN_CONF"
@@ -57,10 +65,10 @@ trap cleanup INT TERM
 # creat VRF tables
 setup_vrf_tables() {
     while read PROVIDER ETHERNET WEIGHT PING_IPS; do
-        TABLE_NAME=${PROVIDER,,}
+        local TABLE_NAME=${PROVIDER,,}
         if ! grep -wq "${TABLE_NAME}\$" <<<"$RT_TABLES"; then
-            RT_TABLE="/etc/iproute2/rt_tables.d/${TABLE_NAME}.conf"
-            NEW_TABLE=$(next_rt_table)
+            local RT_TABLE="/etc/iproute2/rt_tables.d/${TABLE_NAME}.conf"
+            local NEW_TABLE=$(next_rt_table)
             echo -e "${NEW_TABLE}\t${TABLE_NAME}" >"$RT_TABLE"
             RT_TABLES=$(read_rt_tables)
         fi
@@ -87,11 +95,13 @@ migrate_to_vrf() {
 
         # use lease file as input for local routing
         local LEASE_FILE="/var/lib/dhcp/dhclient.${ETHERNET}.leases"
+        local LEASE_PID="/var/lib/dhcp/dhclient.${ETHERNET}.pid"
         [[ -f "$LEASE_FILE" ]] && rm "$LEASE_FILE"
-        ip vrf exec "$TABLE_NAME" dhclient -lf "$LEASE_FILE" "$ETHERNET"
+        ip vrf exec "$TABLE_NAME" dhclient -pf "$LEASE_PID" -lf "$LEASE_FILE" "$ETHERNET"
         local LEASE_OPTIONS=$(awk '/option/{ gsub(";", ""); print $2 "=" $3 }' "$LEASE_FILE")
         local GATEWAY=$(awk -F= '/routers/{ print $2 }' <<<"$LEASE_OPTIONS")
-        ip route add default via "$GATEWAY" dev "$ETHERNET" table "$TABLE_NAME"
+        ip route replace default via "$GATEWAY" dev "$ETHERNET" table "$TABLE_NAME"
+        RT_GATEWAY[$TABLE_NAME]="$GATEWAY"
 
         # ensure VRF networks be routable from local network
         local NETWORKS=$(ip route show dev "$ETHERNET" scope link type unicast table "$TABLE_NAME" | awk '{ print $1 }')
@@ -128,7 +138,16 @@ forward_and_masq() {
 
 setup
 
-# loop forever
-while sleep infinity; do :; done
+while sleep $[CHECK_INTERVAL*5]; do # check forever
+    # FIXME: sometimes the default gateway disappear...
+    while read PROVIDER ETHERNET WEIGHT PING_IPS; do
+        TABLE_NAME=${PROVIDER,,}
+        GATEWAY=$(ip route show default dev "$ETHERNET" table "$TABLE_NAME" | awk '{ print $3 }')
+        if [[ "$GATEWAY" != "${RT_GATEWAY[$TABLE_NAME]}" ]]; then
+            echo "Reapply default route for ${PROVIDER}"
+            ip route replace default via "${RT_GATEWAY[$TABLE_NAME]}" dev "$ETHERNET" table "$TABLE_NAME"
+        fi
+    done <<<"$WAN_CONF"
+done
 
 cleanup
