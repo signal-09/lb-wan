@@ -18,6 +18,7 @@
 /config.status.lineno
 /configure
 /install-sh
+/lb-wan-*/
 /missing
 Makefile
 Makefile.in
