@@ -1,1 +1,3 @@
-aclocal && autoconf && automake --add-missing
+aclocal
+autoconf
+automake --add-missing

@@ -1,10 +1,16 @@
 #!/bin/bash
 
-set -o pipefail
+set -eo pipefail
 
 # load shared components
-DIR=$(dirname -- "${BASH_SOURCE[0]}")
-source "${DIR}/../lib/common.sh"
+SCRIPT=$(realpath -- "${BASH_SOURCE[0]}")
+BINDIR=$(dirname -- "$SCRIPT")
+COMMON="${BINDIR}/common.sh"
+source "$COMMON" || exit 255
+
+
+# track WAN connection status
+declare -A OLD_STATE
 
 
 # delete balanced routes
@@ -15,34 +21,53 @@ cleanup() {
 trap cleanup INT TERM
 
 
-get_routes() {
+get_nexthops() {
     while read PROVIDER ETHERNET WEIGHT PING_IPS; do
         local TABLE_NAME=${PROVIDER,,}
         read LOSS RTT STATE < <(get_wan_status "$PROVIDER")
         if [[ "$STATE" == UP ]]; then
-            local GATEWAY=$(ip -4 route show default dev ${ETHERNET} table "$TABLE_NAME" | awk '{ print $3 }' | head -1)
-            [[ "$GATEWAY" ]] && echo "nexthop via ${GATEWAY} dev ${ETHERNET} weight ${WEIGHT}"
+            local ROUTES=$(ip -4 route show dev "$ETHERNET" table "$TABLE_NAME")
+            local GATEWAY=$(awk '/^default/{ print $3 }' <<<"$ROUTES" | head -1)
+            if [[ "$GATEWAY" ]]; then
+                echo "nexthop via ${GATEWAY} dev ${ETHERNET} weight ${WEIGHT}"
+            else
+                warn "No default route found for ${PROVIDER}"
+                debug "$ROUTES"
+            fi
+        fi
+        if [[ "${OLD_STATE[$PROVIDER]}" != "$STATE" ]]; then
+            log "Changes status for ${PROVIDER} to ${STATE}"
+            OLD_STATE[$PROVIDER]="$STATE"
         fi
     done <<<"$WAN_CONF"
 }
 
 
-while sleep $CHECK_INTERVAL; do
-    [[ $(get_lb_status) != "RUNNING" ]] && continue
+main() {
+    local OLD_ROUTES=''
+    local OLD_DEFAULT=''
+    while sleep $BAL_CHECK_INTERVAL; do
+        [[ $(get_lb_status) == "RUNNING" ]] || continue
 
-    ROUTES=($(get_routes))
-    NEW_ROUTES="${ROUTES[@]}"
-    NEW_DEFAULT=$(ip route show default scope global)
+        stdout_to_var ROUTES get_nexthops
 
-    [[ "$NEW_ROUTES" == "$OLD_ROUTES" && "$NEW_DEFAULT" == "$OLD_DEFAULT" ]] && continue
+        local NEW_ROUTES="${ROUTES[@]}"
+        local NEW_DEFAULT=$(ip route show default scope global)
 
-    if [[ "$NEW_ROUTES" ]]; then
-        echo "Set default route to $NEW_ROUTES"
-        ip route replace default scope global $NEW_ROUTES
-    else
-        echo "WARNING: no WAN detected, removing default route"
-        ip route delete default scope global
-    fi
-    OLD_ROUTES=$NEW_ROUTES
-    OLD_DEFAULT=$(ip route show default scope global)
-done
+        [[ "$NEW_ROUTES" != "$OLD_ROUTES" || "$NEW_DEFAULT" != "$OLD_DEFAULT" ]] || continue
+
+        if [[ "$NEW_ROUTES" ]]; then
+            log "Set default route to $NEW_ROUTES"
+            ip route replace default scope global $NEW_ROUTES
+        else
+            warn "No WAN detected, removing default route"
+            ip route delete default scope global
+        fi
+        OLD_ROUTES=$NEW_ROUTES
+        OLD_DEFAULT=$(ip route show default scope global)
+    done
+}
+
+
+main
+cleanup

@@ -1,17 +1,19 @@
 #!/bin/bash
 
-set -o pipefail
+set -eo pipefail
 
 # load shared components
-DIR=$(dirname -- "${BASH_SOURCE[0]}")
-source "${DIR}/../lib/common.sh"
+SCRIPT=$(realpath -- "${BASH_SOURCE[0]}")
+BINDIR=$(dirname -- "$SCRIPT")
+COMMON="${BINDIR}/common.sh"
+source "$COMMON" || exit 255
 
 
 # delete status files on exit
 cleanup() {
     while read PROVIDER ETHERNET WEIGHT PING_IPS; do
-        STATUS_FILE="${RUN_STATE}/lb_${PROVIDER,,}.status"
-        [[ -f "$STATUS_FILE" ]] && rm -f "$STATUS_FILE"
+        STATUS_FILE="${RUNSTATEDIR}/lb_${PROVIDER,,}.status"
+        [[ -f "$STATUS_FILE" ]] && rm -f "$STATUS_FILE" || :
     done <<<"$WAN_CONF"
     exit
 }
@@ -62,12 +64,12 @@ check_connectivity() {
     fi
 
     # save status
-    [[ "$STATE" != "$OLD_STATE" ]] && echo "Declaring ${PROVIDER} ${STATE}"
+    [[ "$STATE" == "$OLD_STATE" ]] || log "Declaring ${PROVIDER} ${STATE}"
     set_wan_status "$PROVIDER" "$LOSS" "$RTT" "$STATE"
 }
 
 
-while sleep $CHECK_INTERVAL; do # check forever
+while sleep $MON_CHECK_INTERVAL; do
     while read PROVIDER ETHERNET WEIGHT PING_IPS; do
         # asyncronous check
         check_connectivity $PROVIDER $PING_IPS &

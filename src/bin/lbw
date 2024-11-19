@@ -1,0 +1,65 @@
+#!/bin/bash
+
+set -euo pipefail
+
+# load shared components
+SCRIPT=$(realpath -- "${BASH_SOURCE[0]}")
+COMMON="$(dirname -- "$SCRIPT")/common.sh"
+source "$COMMON" || exit 255
+
+get_service_status() {
+    local SERVICE="$1"
+
+    systemctl is-active "lbw-${SERVICE,,}"
+}
+
+
+show_service_status() {
+    local SERVICE="$1"
+
+    echo "${SERVICE}: $(get_service_status "$SERVICE")"
+}
+
+
+list_service_status() {
+    echo "Services:"
+    for SERVICE in VRF Monitor Balancer; do
+        echo "- $(show_service_status "$SERVICE")"
+    done
+}
+
+
+list_wan_status() {
+    echo "WANs:"
+    while read PROVIDER ETHERNET WEIGHT PING_IPS; do
+        local TABLE_NAME=${PROVIDER,,}
+        read LOSS RTT STATE < <(get_wan_status "$PROVIDER")
+        echo "- ${PROVIDER}: ${STATE} (failures: ${LOSS}, latency: ${RTT})"
+    done <<<"$WAN_CONF"
+}
+
+
+show_status() {
+    [[ $# -gt 0 ]] || set 'services' 'wans'
+    for OPT; do
+        if [[ x'services' == x$OPT* ]]; then
+            list_service_status
+        elif [[ x'wans' == x$OPT* ]]; then
+            list_wan_status
+        else
+            error "Unknown \`$OPT' option"
+        fi
+    done
+}
+
+
+if [[ $# -eq 0 ]]; then
+    show_status
+else
+    CMD="$1" && shift
+    if [[ x'status' == x$CMD* ]]; then
+        show_status "$@"
+    else
+        error "Unknown \`$CMD' command"
+    fi
+fi

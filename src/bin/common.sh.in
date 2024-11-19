@@ -1,28 +1,60 @@
 #!/bin/bash
 
 # load variables
-[[ -f @sysconfdir@/default/lb-wan ]] && source @sysconfdir@/default/lb-wan
+[[ -f @sysconfdir@/default/lb-wan ]] && source @sysconfdir@/default/lb-wan || :
+
+SCRIPT=$(basename "$0")
 
 # set default values
+: ${DEBUG:=''}
 : ${CHECK_INTERVAL:=3}
 : ${PING_TIMEOUT:=2}
 : ${MAX_PACKET_LOSS:=5}
 : ${NETWORKING:=auto}
-: ${WAN_BALANCER_CONF:='@sysconfdir@/lb-wan.conf'}
-: ${RUN_STATE:='@runstatedir@'}
+: ${NAMESERVERS:='8.8.8.8,1.1.1.1'}
+: ${SYSCONFDIR:='@sysconfdir@'}
+: ${RUNSTATEDIR:='@runstatedir@'}
+: ${WAN_BALANCER_CONF:="${SYSCONFDIR}/lb-wan.conf"}
+
+: ${VRF_CHECK_INTERVAL:=$[CHECK_INTERVAL*3]}
+: ${MON_CHECK_INTERVAL:=$CHECK_INTERVAL}
+: ${BAL_CHECK_INTERVAL:=$CHECK_INTERVAL}
+
+# normalise variables
+NAMESERVERS=($(tr ':;,' ' ' <<<"$NAMESERVERS"))
+NAMESERVERS="${NAMESERVERS[@]}"
+NAMESERVERS="${NAMESERVERS/ /, }"
 
 
-# print error message then exit
-error() { echo "ERROR: $@" 1>&2; exit 255; }
+# print messages to syslog or stderr if run in terminal
+if test -t 2; then logger() {
+    local LEVEL="$4"
+    local MESSAGE="$5"
+    local LABEL=''
+
+    if [[ "$LEVEL" == 'crit' ]]; then
+        LABEL='ERROR: '
+    elif [[ "$LEVEL" == 'warning' ]]; then
+        LABEL='WARNING: '
+    fi
+    echo "${LABEL}${MESSAGE}" 1>&2;
+}; fi
+syslog() {
+    local LEVEL="$1"
+    shift
+    for LINE; do logger -t "$SCRIPT" -p "${LEVEL}" "${LINE}"; done
+}
 
 
-# prin warning message
-warn() { echo "WARNING: $@" 1>&2; }
+error() { syslog 'crit' "$@"; exit 255; }
+warn() { syslog 'warning' "$@"; }
+log() { syslog 'notice' "$@"; }
+debug() { [[ "$DEBUG" ]] && syslog 'debug' "$@" || :; }
 
 
 get_lb_status() {
-    if [[ -f "${RUN_STATE}/lb-wan.status" ]]; then
-        cat "${RUN_STATE}/lb-wan.status"
+    if [[ -f "${RUNSTATEDIR}/lb-wan.status" ]]; then
+        cat "${RUNSTATEDIR}/lb-wan.status"
     else
         echo "STOPPED"
     fi
@@ -31,7 +63,7 @@ get_lb_status() {
 
 get_wan_status() {
     local PROVIDER=${1,,}
-    local STATUS_FILE="${RUN_STATE}/lb_${PROVIDER}.status"
+    local STATUS_FILE="${RUNSTATEDIR}/lb_${PROVIDER}.status"
 
     if [[ -f "$STATUS_FILE" ]]; then
         cat "$STATUS_FILE"
@@ -46,9 +78,11 @@ set_wan_status() {
     local LOSS=${2:-$MAX_PACKET_LOSS}
     local RTT=${3:--}
     local STATE=${4:-DOWN}
-    local STATUS_FILE="${RUN_STATE}/lb_${PROVIDER}.status"
+    local STATUS_FILE="${RUNSTATEDIR}/lb_${PROVIDER}.status"
 
-    echo -e "${LOSS}\t${RTT}\t${STATE}" >"$STATUS_FILE"
+    # to avoid empty file read, first write then move
+    echo -e "${LOSS}\t${RTT}\t${STATE}" >"${STATUS_FILE}.tmp"
+    mv -f "${STATUS_FILE}.tmp" "$STATUS_FILE"
 }
 
 
@@ -58,10 +92,35 @@ get_next_rule_priority() {
 }
 
 
+get_last_lease() {
+    local LEASE_FILE="$1"
+
+    sed -e ':a;N;$!ba;s/\([{;]\)\n */\1/g' "$LEASE_FILE" \
+    | sed -e 's/^lease {//' -e 's/;}$//' \
+    | tail -1 \
+    | tr ';' '\n'
+}
+
+
+get_lease_options() {
+    local LEASE="$1"
+
+    awk '/option/{ print $2 "=" $3 }' <<<"$LEASE"
+}
+
+
+get_template() {
+    local TEMPLATE="/usr/libexec/lb-wan/templates/${1}.in"
+    [[ -f "$TEMPLATE" ]] || error "Template file for \`${1}' not found"
+    TEMPLATE="$(cat "$TEMPLATE")"
+    echo "${TEMPLATE@P}"
+}
+
+
 read_rt_tables() {
-    grep -Ehv '^$|^#' /etc/iproute2/rt_tables /etc/iproute2/rt_tables.d/*.conf 2>/dev/null | \
-        sort -u | \
-        awk '{ print $1 " " $2 }'
+    grep -Ehv '^$|^#' /etc/iproute2/rt_tables /etc/iproute2/rt_tables.d/*.conf 2>/dev/null \
+    | sort -u \
+    | awk '{ print $1 " " $2 }'
 }
 
 
@@ -69,7 +128,7 @@ next_rt_table() {
     local INDEX=0
 
     while read TABLE NAME; do
-        [[ $TABLE -ge 253 || $TABLE -gt $INDEX ]] && break
+        [[ $TABLE -lt 253 && $TABLE -le $INDEX ]] || break
         INDEX=$[TABLE + 1]
     done <<<"$RT_TABLES"
 
@@ -122,6 +181,23 @@ if_down() {
 }
 
 
+stdout_to_var() {
+    local VAR="$1"
+    local FUNCTION="$2"
+    shift 2
+
+    # FIXME: https://www.reddit.com/r/bash/comments/135mdqt/no_redirect_to_variable/
+    # Is there something better to avoid subshell and preserve variables changes?
+    exec 4<><(:)
+    {
+        $FUNCTION "$@"
+        printf '\0'
+    } 1>&4
+    read -r -d '' -u 4 -a $VAR
+    exec 4>&-
+}
+
+
 # load config file
 if [[ -f "$WAN_BALANCER_CONF" ]]; then
     WAN_CONF=$(grep -vE '^$|^#|^LAN' "$WAN_BALANCER_CONF")
@@ -129,7 +205,9 @@ if [[ -f "$WAN_BALANCER_CONF" ]]; then
         error "Config file \`${WAN_BALANCER_CONF}' is empty"
     fi
     LAN_INT=$(awk '/^LAN[[:space:]]/{ print $2 }' "$WAN_BALANCER_CONF")
-    [[ "$LAN_INT" ]] && LAN_NET=$(ip route show dev $LAN_INT scope link | awk '{ print $1 }')
+    if [[ "$LAN_INT" ]]; then
+        LAN_NET=$(ip route show dev $LAN_INT scope link | awk '{ print $1 }')
+    fi
 else
     error "Config file \`${WAN_BALANCER_CONF}' not present"
 fi
@@ -160,5 +238,5 @@ RT_TABLES=$(read_rt_tables)
 IP_FORWARD=$(sysctl -n net.ipv4.ip_forward)
 IPV6_FORWARD=$(sysctl -n net.ipv6.conf.all.forwarding)
 IPTABLES_FORWARD=$(iptables -t filter -S | awk '/^-P FORWARD/{ print $3 }')
-[[ $IP_FORWARD -ne 1 ]] && warn "Packet forwarding not enabled"
-[[ "$IPTABLES_FORWARD" != 'ACCEPT' ]] && warn "Filtered iptables forwarding"
+[[ $IP_FORWARD -eq 1 ]] || warn "Packet forwarding not enabled"
+[[ "$IPTABLES_FORWARD" == 'ACCEPT' ]] || warn "Filtered iptables forwarding"

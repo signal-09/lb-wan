@@ -7,8 +7,14 @@ dist_systemdsystemunit_DATA = lbw-vrf.service lbw-monitor.service lbw-balancer.s
 all-am: $(dist_systemdsystemunit_DATA)
 	@touch *.service.in
 
+edit = sed \
+	-e 's|@libdir[@]|$(libdir)|g' \
+	-e 's|@pkglibexecdir[@]|$(pkglibexecdir)|g' \
+	-e 's|@runstatedir[@]|$(runstatedir)|g' \
+	-e 's|@sysconfdir[@]|$(sysconfdir)|g'
+
 $(dist_systemdsystemunit_DATA): %: %.in
-	@sed -e 's|@bindir[@]|$(bindir)|g' $< >$@
+	@$(edit) $< >$@
 
 clean-local:
 	@-rm -f $(dist_systemdsystemunit_DATA)

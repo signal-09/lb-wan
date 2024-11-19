@@ -17,7 +17,5 @@ AS_IF([test "x$with_systemdsystemunitdir" != "xno"],
       [AC_SUBST([systemdsystemunitdir], [$with_systemdsystemunitdir])])
 AM_CONDITIONAL([HAVE_SYSTEMD], [test "x$with_systemdsystemunitdir" != "xno"])
 
-AC_SUBST([exec_prefix], ${localstatedir}/lib/AC_PACKAGE_NAME)
-
-AC_CONFIG_FILES([Makefile src/bin/Makefile src/etc/Makefile src/systemd/Makefile])
+AC_CONFIG_FILES([Makefile src/bin/Makefile src/etc/Makefile src/systemd/Makefile src/templates/Makefile])
 AC_OUTPUT

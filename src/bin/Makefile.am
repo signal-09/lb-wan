@@ -1,17 +1,22 @@
-all-am: common.sh
-	@touch *.in
+pkglibexec_SCRIPTS = lbw lbw-vrf lbw-monitor lbw-balancer
 
-dist_bin_SCRIPTS = lbw-vrf lbw-monitor lbw-balancer
-
-commondir = $(libdir)
+commondir = $(pkglibexecdir)
 common_DATA = common.sh
 
+all-am: $(common_DATA)
+	@touch *.in
+
 edit = sed \
+	-e 's|@libdir[@]|$(libdir)|g' \
+	-e 's|@pkglibexecdir[@]|$(pkglibexecdir)|g' \
 	-e 's|@runstatedir[@]|$(runstatedir)|g' \
 	-e 's|@sysconfdir[@]|$(sysconfdir)|g'
 
-common.sh: common.sh.in
+$(common_DATA): %: %.in
 	@$(edit) $< >$@
+
+install-exec-hook:
+	ln -sf $(DETDIR)$(pkglibexecdir)/lbw $(DESTDIR)$(sbindir)/lbw
 
 clean-local:
 	@-rm -f $(common_DATA)

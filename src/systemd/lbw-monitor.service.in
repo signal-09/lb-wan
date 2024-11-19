@@ -4,7 +4,7 @@ After=network.target lbw-vrf.service
 Requires=lbw-vrf.service
 
 [Service]
-ExecStart=@bindir@/lbw-monitor
+ExecStart=@pkglibexecdir@/lbw-monitor
 Restart=on-failure
 RestartPreventExitStatus=0 255
 

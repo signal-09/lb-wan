@@ -9,3 +9,6 @@ MAX_PACKET_LOSS=5
 
 # Network manager (auto|ifupdown|netplan|manual)
 NETWORKING=auto
+
+# Comma or space separated DNS servers
+NAMESERVERS="8.8.8.8,8.8.4.4"
