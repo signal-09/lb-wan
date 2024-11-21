@@ -45,6 +45,7 @@ check_connectivity() {
 
     # get last connection status
     read LOSS OLD_RTT OLD_STATE < <(get_wan_status "$PROVIDER")
+    debug "${PROVIDER}: LOSS=${LOSS} RTT=${OLD_RTT} STATE=${OLD_STATE}"
 
     # adapt status value
     if [[ $REACHED == true ]]; then

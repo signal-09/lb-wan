@@ -11,4 +11,4 @@ MAX_PACKET_LOSS=5
 NETWORKING=auto
 
 # Comma or space separated DNS servers
-NAMESERVERS="8.8.8.8,8.8.4.4"
+#NAMESERVERS="0.0.0.0"

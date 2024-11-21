@@ -35,10 +35,7 @@ get_nexthops() {
                 debug "$ROUTES"
             fi
         fi
-        if [[ "${OLD_STATE[$PROVIDER]}" != "$STATE" ]]; then
-            log "Changes status for ${PROVIDER} to ${STATE}"
-            OLD_STATE[$PROVIDER]="$STATE"
-        fi
+        OLD_STATE[$PROVIDER]="$STATE"
     done <<<"$WAN_CONF"
 }
 
