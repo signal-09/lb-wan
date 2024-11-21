@@ -43,7 +43,7 @@ declare -A COLOR=(
 
 
 # print messages to syslog or stderr if run in terminal
-if [[ "$TERM" ]]; then logger() {
+if test -t 0; then logger() {
     local LEVEL="$4"
     local MESSAGE="$5"
     local START END

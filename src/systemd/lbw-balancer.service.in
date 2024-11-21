@@ -4,6 +4,7 @@ After=network.target lbw-monitor.service
 Requires=lbw-monitor.service
 
 [Service]
+LogNamespace=lbw
 ExecStart=@pkglibexecdir@/lbw-balancer
 Restart=on-failure
 RestartPreventExitStatus=0 255

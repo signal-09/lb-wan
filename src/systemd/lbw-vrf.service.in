@@ -3,6 +3,7 @@ Description=Load Balancer VRF
 After=network.target
 
 [Service]
+LogNamespace=lbw
 ExecStart=@pkglibexecdir@/lbw-vrf
 Restart=on-failure
 RestartPreventExitStatus=0 255

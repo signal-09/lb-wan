@@ -83,7 +83,7 @@ vrf_dhclient() {
             -cf "$LEASE_CONF" \
             -pf "$LEASE_PID" \
             -lf "$LEASE_FILE" \
-            "$ETHERNET"
+            "$ETHERNET" &>/dev/null
 }
 
 # enslave interfaces to VRF
@@ -164,6 +164,7 @@ main() {
         done <<<"$WAN_CONF"
     done
 }
+
 
 setup
 main

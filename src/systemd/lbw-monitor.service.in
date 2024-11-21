@@ -4,6 +4,7 @@ After=network.target lbw-vrf.service
 Requires=lbw-vrf.service
 
 [Service]
+LogNamespace=lbw
 ExecStart=@pkglibexecdir@/lbw-monitor
 Restart=on-failure
 RestartPreventExitStatus=0 255
