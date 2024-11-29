@@ -1,30 +1,40 @@
 #!/bin/bash
 
-set -euo pipefail
+set -eo pipefail
 
 # load shared components
 SCRIPT=$(realpath -- "${BASH_SOURCE[0]}")
-COMMON="$(dirname -- "$SCRIPT")/common.sh"
+LIBDIR=$(dirname -- "$SCRIPT")
+COMMON="${LIBDIR}/common.sh"
 source "$COMMON" || exit 255
 
-get_service_status() {
-    local SERVICE="$1"
 
-    systemctl is-active "lbw-${SERVICE,,}"
+HELP="Usage: ${SCRIPT} [OPTIONS] OBJECT { COMMAND | help }
+OBJECT := { service | wan | help }
+OPTIONS:
+    -h, --help           Show this help
+    -d, --debug          Run in debug mode (implies -f)
+    -f, --foreground     Run in foreground mode
+    -t, --timestamp      Print timestamp in log lines
+        --trace[=FILE]   Print executed commands in a .trace file"
+
+
+do_help() {
+    echo "$HELP"
+    exit
 }
 
 
-show_service_status() {
-    local SERVICE="$1"
-
-    echo "${SERVICE}: $(get_service_status "$SERVICE")"
+do_usage() {
+    log "$HELP"
+    exit 255
 }
 
 
 list_service_status() {
     echo "Services:"
-    for SERVICE in VRF Monitor Balancer; do
-        echo "- $(show_service_status "$SERVICE")"
+    for SERVICE in VRF Balancer; do
+        echo "- ${SERVICE}: $(get_service_status "${SERVICE}")"
     done
 }
 
@@ -39,27 +49,171 @@ list_wan_status() {
 }
 
 
-show_status() {
-    [[ $# -gt 0 ]] || set 'services' 'wans'
-    for OPT; do
-        if [[ x'services' == x$OPT* ]]; then
-            list_service_status
-        elif [[ x'wans' == x$OPT* ]]; then
-            list_wan_status
+get_service_pid() {
+    local SERVICE=${1,,}
+    local PID_FILE="${RUNSTATEDIR}/lbw-${SERVICE}.pid"
+
+    if [[ -f "$PID_FILE" ]]; then
+        local PID=$(cat "$PID_FILE")
+        if ! kill -0 $PID &>/dev/null; then
+            echo -e "${COLOR[LIGHT_RED]}${PID}${COLOR[RESET]}"
         else
-            error "Unknown \`$OPT' option"
+            local PARENT=$(awk -F ':[[:space:]]+' '/PPid:/{ print $2 }' /proc/${PID}/status)
+            if [[ $PARENT -eq 1 ]]; then
+                echo -e "${COLOR[LIGHT_GREEN]}${PID}${COLOR[RESET]}"
+            else
+                echo -e "${COLOR[YELLOW]}${PID}${COLOR[RESET]}"
+            fi
         fi
+    fi
+}
+
+
+get_service_status() {
+    local SERVICE=${1,,}
+    local STATUS=$(systemctl is-active lbw-${SERVICE})
+
+    case "$STATUS" in
+    'active')
+        STATUS="${COLOR[LIGHT_GREEN]}${STATUS}${COLOR[RESET]}"
+        ;;
+    'failed')
+        STATUS="${COLOR[LIGHT_RED]}${STATUS}${COLOR[RESET]}"
+        ;&
+    'inactive')
+        if PID=$(pidof -x -o $$ "lbw-${SERVICE}"); then
+            STATUS="${COLOR[YELLOW]}running${COLOR[RESET]}"
+        fi
+        ;;
+    esac
+
+    echo -e "$STATUS"
+}
+
+
+do_service_list() {
+    local SERVICE
+    for SERVICE in VRF Balancer; do
+        local PID=$(get_service_pid "${SERVICE}")
+        echo "${SERVICE}${PID:+[${PID}]}: $(get_service_status "${SERVICE}")"
     done
 }
 
 
-if [[ $# -eq 0 ]]; then
-    show_status
-else
-    CMD="$1" && shift
-    if [[ x'status' == x$CMD* ]]; then
-        show_status "$@"
-    else
-        error "Unknown \`$CMD' command"
+do_service_start() {
+    local SERVICE
+
+    [[ $# -gt 0 && ${1,,} != 'all' ]] || set -- 'VRF' 'Balancer'
+
+    if [[ "$FOREGROUND" ]]; then
+        test $# -eq 1 || fatal "Only one service at a time are allowed in foreground"
+        SERVICE=${1,,}
+        exec -a "lbw-${SERVICE}" "${LIBDIR}/lbw-${SERVICE}"
     fi
+
+    for SERVICE; do
+        systemctl start lbw-${SERVICE,,}
+    done
+}
+
+
+do_service_stop() {
+    local SERVICE
+
+    [[ $# -gt 0 && ${1,,} != 'all' ]] || set -- 'VRF' 'Balancer'
+
+    for SERVICE; do
+        systemctl stop lbw-${SERVICE,,}
+    done
+}
+
+
+do_service_status() {
+    local SERVICE
+
+    [[ $# -gt 0 && ${1,,} != 'all' ]] || set -- 'VRF' 'Balancer'
+
+    for SERVICE; do
+        systemctl status lbw-${SERVICE,,} || :
+    done
+}
+
+
+do_service() {
+    local CMD='list'
+    local HELP="Usage: ${SCRIPT} service { COMMAND }
+COMMAND:
+    help                          Show this help
+    list                          List services and brief status
+    start [ SERVICE... | all ]    Start services
+    stop [ SERVICE... | all ]     Stop services
+    status [ SERVICE... | all ]   Display status of services
+    enable                        Enable LB-Wan services to be started at boot
+    disable                       Disable LB-Wan services to be started at boot
+SERVICE:
+    VRF                           Virtual Routing and Forwarding service
+    Balancer                      Balancer service"
+
+    if [[ $# -gt 0 ]]; then
+        CMD=$1
+        shift
+    fi
+
+    local SERVICE
+    for SERVICE in "$@"; do
+        case "${SERVICE,,}" in
+        'vrf'|'balancer');;
+        'all') test $# -eq 1 || fatal "\`all' meta service cannot be mixed with other services";;
+        *) fatal "Service \`${SERVICE}' is unknown, try \`${SCRIPT} service help'";;
+        esac
+    done
+
+    if [[ x'list' == x${CMD}* ]]; then
+        do_service_list "$@"
+    elif [[ x'start' == x${CMD} ]]; then
+        do_service_start "$@"
+    elif [[ x'stop' == x${CMD} ]]; then
+        do_service_stop "$@"
+    elif [[ x'status' == x${CMD} ]]; then
+        do_service_status "$@"
+    elif [[ x'help' == x${CMD}* ]]; then
+        do_help
+    else
+        fatal "Command \`${CMD}' is unknown, try \`${SCRIPT} service help'"
+    fi
+}
+
+# parse command options
+OPTS=$(getopt -o hdft --long help,debug,foreground,timestamp,trace:: -q -- "$@") || fatal "Unrecognized options"
+eval set -- "$OPTS"
+unset OPTS
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+    -h|--help) do_help;;
+    -d|--debug) export DEBUG=1;&
+    -f|--foregraund) export FOREGROUND=1;;
+    -t|--timestamp) export TIMESTAMP=1;;
+    --trace)
+        export TRACE=3
+        test -z "$2" || export TRACE_FILE="$2"
+        shift
+        ;;
+    --) shift; break;;
+    *) fatal "Unrecognized option \`$1'";;
+    esac
+    shift
+done
+
+test $# -gt 0 || do_usage
+
+OBJ=$1
+shift
+
+if [[ x'service' == x${OBJ}* ]]; then
+    do_service "$@"
+elif [[ x'help' == x${OBJ}* ]]; then
+    do_help
+else
+    fatal "Object \`${OBJ}' is unknown, try \`${SCRIPT} help'"
 fi

@@ -129,7 +129,13 @@ MAX_PACKET_LOSS=5
 NETWORKING=auto
 
 # Comma or space separated DNS servers
-#NAMESERVERS="8.8.8.8,8.8.4.4"
+#NAMESERVERS="0.0.0.0"
+
+# Allow LB-Wan to manage iptables rules (e.g. FORWARD and NAT)
+#IPTABLES=yes
+
+# Setup IPv6 (EXPERIMENTAL)
+#IPV6=no
 ```
 
 
@@ -138,12 +144,11 @@ NETWORKING=auto
 #### Start the service:
 
 ```shell
-> systemctl start lbw-vrf
-> systemctl start lbw-monitor
-> systemctl start lbw-balancer
+> sudo systemctl start lbw-vrf
+> sudo systemctl start lbw-balancer
+OR
+> sudo lbw service start
 ```
-
-Due to service dependencies, starting `lbw-balancer` will start all the other services.
 
 Routing table will change as follows:
 
@@ -156,15 +161,36 @@ default
 192.168.0.0/24 dev eth0 proto kernel scope link src 192.168.0.254 
 ```
 
+For debugging purpose every service can be started in foreground (`-f`) or in debugging mode (`-d`):
+
+```shell
+> sudo lbw -f -t service start vrf
+Nov 29 17:31:04 lbw-vrf[3791029]: net.ipv4.tcp_l3mdev_accept = 1
+Nov 29 17:31:04 lbw-vrf[3791029]: net.ipv4.udp_l3mdev_accept = 1
+Nov 29 17:31:04 lbw-vrf[3791029]: net.ipv4.ip_forward = 1
+Nov 29 17:31:04 lbw-vrf[3791029]: Natting interface eth0 from 192.168.0.0/24
+Nov 29 17:31:04 lbw-vrf[3791029]: Natting interface eth1 from 192.168.0.0/24
+Nov 29 17:31:04 lbw-vrf[3791029]: Natting interface eth2 from 192.168.0.0/24
+Nov 29 17:31:04 lbw-vrf[3791029]: Natting interface eth3 from 192.168.0.0/24
+Nov 29 17:31:22 lbw-vrf[3791029]: Declaring FTTH UP
+Nov 29 17:31:22 lbw-vrf[3791029]: Declaring FTTC UP
+Nov 29 17:31:23 lbw-vrf[3791029]: Declaring FWA UP
+```
+
+```shell
+> lbw -f -t service start balancer
+Nov 29 17:59:00 lbw-balancer[3815641]: VRF service become available
+Nov 29 17:59:00 lbw-balancer[3815641]: Set default route for IPv4 to nexthop via 172.16.1.1 dev eth1 weight 50 nexthop via 172.16.2.1 dev eth2 weight 30 nexthop via 172.16.3.1 dev eth3 weight 20
+```
+
 #### Stop the service:
 
 ```shell
-> systemctl stop lbw-balancer
-> systemctl stop lbw-monitor
-> systemctl stop lbw-vrf
+> sudo systemctl stop lbw-balancer
+> sudo systemctl stop lbw-vrf
+OR
+> sudo lbw service stop
 ```
-
-Due to service dependencies, stopping `lbw-vrf` will stop all the other services.
 
 
 ## Suggestions

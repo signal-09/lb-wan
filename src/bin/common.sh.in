@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # load variables
-[[ -f @sysconfdir@/default/lb-wan ]] && source @sysconfdir@/default/lb-wan || :
+test -f '@sysconfdir@/default/lb-wan' && source '@sysconfdir@/default/lb-wan' || :
 
 SCRIPT=$(basename "$0")
 
@@ -11,16 +11,21 @@ SCRIPT=$(basename "$0")
 : ${PING_TIMEOUT:=2}
 : ${MAX_PACKET_LOSS:=5}
 : ${NETWORKING:=auto}
+: ${IPTABLES:=yes}
+: ${IPV6:=no}
+: ${DATE_FORMAT:='%b %d %X'}
 : ${SYSCONFDIR:='@sysconfdir@'}
 : ${RUNSTATEDIR:='@runstatedir@'}
 : ${WAN_BALANCER_CONF:="${SYSCONFDIR}/lb-wan.conf"}
+: ${PID_FILE:="${RUNSTATEDIR}/${SCRIPT}.pid"}
+: ${TRACE_FILE:="${RUNSTATEDIR}/${SCRIPT}.trace"}
 
-: ${VRF_CHECK_INTERVAL:=$[CHECK_INTERVAL*3]}
-: ${MON_CHECK_INTERVAL:=$CHECK_INTERVAL}
-: ${BAL_CHECK_INTERVAL:=$CHECK_INTERVAL}
+
+# avoid errors in file expansion
+shopt -s nullglob
 
 # TTY colors
-declare -A COLOR=(
+test ! -t 1 || declare -A COLOR=(
     [BLACK]='\033[0;30m'
     [RED]='\033[0;31m'
     [GREEN]='\033[0;32m'
@@ -43,10 +48,10 @@ declare -A COLOR=(
 
 
 # print messages to syslog or stderr if run in terminal
-if test -t 0; then logger() {
+test ! -t 0 || logger() {
     local LEVEL="$4"
-    local MESSAGE="$5"
-    local START END
+    local STAMP START END
+    shift 4
 
     if test -t 2; then
         if [[ "$LEVEL" == 'crit' ]]; then
@@ -55,27 +60,112 @@ if test -t 0; then logger() {
         elif [[ "$LEVEL" == 'warning' ]]; then
             START="${COLOR[YELLOW]}"
             END="${COLOR[RESET]}"
+        elif [[ "$LEVEL" == 'debug' ]]; then
+            START="${COLOR[DARK_GRAY]}"
+            END="${COLOR[RESET]}"
         fi
     fi
-    echo -e "${START}${MESSAGE}${END}" 1>&2
-}; fi
+
+    test -z "$TIMESTAMP" || STAMP="$(date "+${DATE_FORMAT}") ${SCRIPT}[$$]: "
+
+    for MESSAGE; do
+        test -n "$MESSAGE" || continue
+        while IFS='' read -r LINE; do
+            echo -e "${STAMP}${START}${LINE}${END}"
+        done <<<"$MESSAGE"
+    done 1>&2
+}
 syslog() {
     local LEVEL="$1"
     shift
-    for LINE; do logger -t "$SCRIPT" -p "$LEVEL" "$LINE"; done
+    logger -t "$SCRIPT" -p "$LEVEL" "$@"
 }
-error() { syslog 'crit' "$@"; exit 255; }
+fatal() { syslog 'crit' "$@"; exit 255; }
+error() { syslog 'crit' "$@"; }
 warn() { syslog 'warning' "$@"; }
 log() { syslog 'notice' "$@"; }
-debug() { [[ -z "$DEBUG" ]] || syslog 'debug' "$@"; }
+debug() { test -z "$DEBUG" || syslog 'debug' "$@"; }
 
 
-get_lb_status() {
-    if [[ -f "${RUNSTATEDIR}/lb-wan.status" ]]; then
-        cat "${RUNSTATEDIR}/lb-wan.status"
+# exec command and log
+cmd() {
+    local ERR=0
+    local CMD=$1
+    local ARGS=''
+    local STDOUT STDERR
+
+    # FIXME: is there a better method to preserve original quotes?
+    shift
+    for ARG in ${*@Q}; do
+        [[ "$ARG" =~ ' ' ]] || ARG=${ARG:1:-1} && ARGS+=" ${ARG}"
+    done
+    debug "Executing: ${CMD}${ARGS}"
+
+    # redirect STDOUT/STDERR to variables for logging
+    exec 4<><(:) 5<><(:)
+    $CMD "$@" 1>&4 2>&5 || ERR=$?
+    printf '\0' 1>&4
+    printf '\0' 1>&5
+    read -r -d '' -u 4 STDOUT
+    read -r -d '' -u 5 STDERR
+    exec 4>&- 5>&-
+
+    log "$STDOUT"
+    if [[ $ERR -eq 0 ]]; then
+        warn "$STDERR"
     else
-        echo "STOPPED"
+        error "Command \`${CMD}' exited with error code: ${ERR}"
+        error "$STDERR"
     fi
+
+    return $ERR
+}
+
+
+# register and remove our presence in a PID file
+trap_pid() {
+    local PID
+    if [[ -f "$PID_FILE" ]]; then
+        PID=$(cat "$PID_FILE")
+        if kill -0 "$PID" &>/dev/null; then
+            fatal "${SCRIPT}[${PID}]: already running"
+        else
+            warn "Replacing dead process ${SCRIPT}[${PID}]"
+        fi
+    fi
+    echo "$$" >"$PID_FILE" && trap "rm -f '${PID_FILE}'" EXIT
+}
+
+
+bool() {
+    case "${1,,}" in
+    '1'|'yes'|'true') return 0;;
+    '0'|'no'|'false') return 1;;
+    *) fatal "Boolean value \`${1}' not allowed";;
+    esac
+}
+
+
+set_status() {
+    local STATUS_FILE="${RUNSTATEDIR}/${SCRIPT}.status"
+
+    echo "$1" >"$STATUS_FILE"
+}
+
+
+get_status() {
+    local STATUS_FILE="${RUNSTATEDIR}/${1:-$SCRIPT}.status"
+
+    if [[ -f "$STATUS_FILE" ]]; then
+        cat "$STATUS_FILE"
+    else
+        echo 'STOPPED'
+    fi
+}
+
+
+clear_status() {
+    rm -f "${RUNSTATEDIR}/${SCRIPT}.status"
 }
 
 
@@ -86,7 +176,7 @@ get_wan_status() {
     if [[ -f "$STATUS_FILE" ]]; then
         cat "$STATUS_FILE"
     else
-        echo "$MAX_PACKET_LOSS - DOWN"
+        echo -e "${MAX_PACKET_LOSS}\t-\tDOWN"
     fi
 }
 
@@ -101,6 +191,14 @@ set_wan_status() {
     # to avoid empty file read, first write then move
     echo -e "${LOSS}\t${RTT}\t${STATE}" >"${STATUS_FILE}.tmp"
     mv -f "${STATUS_FILE}.tmp" "$STATUS_FILE"
+}
+
+
+clear_wan_status() {
+    local PROVIDER=${1,,}
+    local STATUS_FILE="${RUNSTATEDIR}/lb_${PROVIDER}.status"
+
+    test -f "$STATUS_FILE" && rm -f "$STATUS_FILE" || :
 }
 
 
@@ -129,7 +227,7 @@ get_lease_options() {
 
 get_template() {
     local TEMPLATE="/usr/libexec/lb-wan/templates/${1}.in"
-    [[ -f "$TEMPLATE" ]] || error "Template file for \`${1}' not found"
+    test -f "$TEMPLATE" || fatal "Template file for \`${1}' not found"
     TEMPLATE="$(cat "$TEMPLATE")"
     echo "${TEMPLATE@P}"
 }
@@ -157,7 +255,7 @@ next_rt_table() {
     local INDEX=0
 
     while read TABLE NAME; do
-        [[ $TABLE -lt 253 && $TABLE -le $INDEX ]] || break
+        test $TABLE -lt 253 -a $TABLE -le $INDEX || break
         INDEX=$[TABLE + 1]
     done <<<"$RT_TABLES"
 
@@ -171,7 +269,7 @@ if_managed() {
 
     case "$NETWORKING" in
     'ifupdown') ( ifquery -l | grep -q "^${ETHERNET}$" ) && echo "$NETWORKING" || echo 'manual';;
-    'netplan') [[ $(netplan get "ethernets.${ETHERNET}") != 'null' ]] && echo "$NETWORKING" || echo 'manual';;
+    'netplan') test $(netplan get "ethernets.${ETHERNET}") != 'null' && echo "$NETWORKING" || echo 'manual';;
     *) echo 'manual';;
     esac
 }
@@ -183,7 +281,7 @@ if_up() {
     local NETWORKING=$(if_managed "$ETHERNET")
 
     case "$NETWORKING" in
-    'ifupdown') ifup "$ETHERNET";;
+    'ifupdown') cmd ifup "$ETHERNET";;
     'netplan')
         # TODO:
         # netplan get "ethernets.${ETHERNET}"
@@ -201,10 +299,10 @@ if_down() {
     local NETWORKING=$(if_managed "$ETHERNET")
 
     case "$NETWORKING" in
-    'ifupdown') ifdown "$ETHERNET";;
+    'ifupdown') cmd ifdown "$ETHERNET";;
     'netplan'|'manual')
-        ip link set dev "$ETHERNET" down
-        ip addr flush dev "$ETHERNET"
+        cmd ip link set dev "$ETHERNET" down
+        cmd ip addr flush dev "$ETHERNET"
         ;;
     esac
 }
@@ -227,10 +325,19 @@ stdout_to_var() {
 }
 
 
-# Avoid multiple instances
-if PID=$(pidof -x -o $$ "$SCRIPT"); then
-    error "${SCRIPT}[${PID// /,}]: already running"
+# enable tracing to file
+if [[ "$TRACE" ]]; then
+    eval "exec ${TRACE}>'${TRACE_FILE}'"
+    BASH_XTRACEFD=$TRACE
+    set -x
 fi
+
+
+# avoid multiple instances
+if PID=$(pidof -x -o $$ "$SCRIPT"); then
+    fatal "${SCRIPT}[${PID// /,}]: already running"
+fi
+
 
 # identify networking
 if [[ "$NETWORKING" == 'auto' ]]; then
@@ -241,13 +348,13 @@ if [[ "$NETWORKING" == 'auto' ]]; then
     fi
 fi
 if [[ "$NETWORKING" == 'ifupdown' ]]; then
-    [[ $(type -ft ifquery) == 'file' ]] || error "\`ifupdown' tool not found, change NETWORKING in /etc/default/lb-wan.conf"
-    ifquery --state &>/dev/null || error "\`ifupdown' not configured"
+    test $(type -ft ifquery) == 'file' || fatal "\`ifupdown' tool not found, change NETWORKING in /etc/default/lb-wan.conf"
+    ifquery --state &>/dev/null || fatal "\`ifupdown' not configured"
 elif [[ "$NETWORKING" == 'netplan' ]]; then
-    [[ $(type -ft netplan) == 'file' ]] || error "\`netplan' tool not found, change NETWORKING in /etc/default/lb-wan.conf"
-    netplan status &>/dev/null || error "\`netplan' not configured"
+    test $(type -ft netplan) == 'file' || fatal "\`netplan' tool not found, change NETWORKING in /etc/default/lb-wan.conf"
+    netplan status &>/dev/null || fatal "\`netplan' not configured"
 elif [[ "$NETWORKING" != 'manual' ]]; then
-    error "Unsupported network configuration tool"
+    fatal "Unsupported network configuration tool"
 fi
 
 
@@ -255,7 +362,7 @@ fi
 if [[ -f "$WAN_BALANCER_CONF" ]]; then
     WAN_CONF=$(grep -vE '^$|^#|^LAN' "$WAN_BALANCER_CONF")
     if ! [[ "$WAN_CONF" ]]; then
-        error "Config file \`${WAN_BALANCER_CONF}' is empty"
+        fatal "Config file \`${WAN_BALANCER_CONF}' is empty"
     fi
     LAN_INT=$(awk '/^LAN[[:space:]]/{ print $2 }' "$WAN_BALANCER_CONF")
     if [[ "$LAN_INT" ]]; then
@@ -263,7 +370,7 @@ if [[ -f "$WAN_BALANCER_CONF" ]]; then
         LAN_DNS=($(get_nameservers "$LAN_INT"))
     fi
 else
-    error "Config file \`${WAN_BALANCER_CONF}' not present"
+    fatal "Config file \`${WAN_BALANCER_CONF}' not present"
 fi
 
 
@@ -276,10 +383,3 @@ NAMESERVERS="${NAMESERVERS// /, }"
 
 # load rt_tables
 RT_TABLES=$(read_rt_tables)
-
-# check for packet forwarding
-IP_FORWARD=$(sysctl -n net.ipv4.ip_forward)
-IPV6_FORWARD=$(sysctl -n net.ipv6.conf.all.forwarding)
-IPTABLES_FORWARD=$(iptables -t filter -S | awk '/^-P FORWARD/{ print $3 }')
-[[ $IP_FORWARD -eq 1 ]] || warn "Packet forwarding not enabled"
-[[ "$IPTABLES_FORWARD" == 'ACCEPT' ]] || warn "Filtered iptables forwarding"

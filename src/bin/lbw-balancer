@@ -9,15 +9,13 @@ COMMON="${BINDIR}/common.sh"
 source "$COMMON" || exit 255
 
 
-# track WAN connection status
-declare -A OLD_STATE
-
-
 # delete balanced routes
 cleanup() {
-    ip route delete default scope global
+    debug "Cleaning default route on exit"
+    cmd ip route delete default scope global
     exit
 }
+trap_pid
 trap cleanup INT TERM
 
 
@@ -26,45 +24,96 @@ get_nexthops() {
         local TABLE_NAME=${PROVIDER,,}
         read LOSS RTT STATE < <(get_wan_status "$PROVIDER")
         if [[ "$STATE" == UP ]]; then
-            local ROUTES=$(ip -4 route show dev "$ETHERNET" table "$TABLE_NAME")
+            local ROUTES=$(ip "$@" route show dev "$ETHERNET" table "$TABLE_NAME")
             local GATEWAY=$(awk '/^default/{ print $3 }' <<<"$ROUTES" | head -1)
             if [[ "$GATEWAY" ]]; then
                 echo "nexthop via ${GATEWAY} dev ${ETHERNET} weight ${WEIGHT}"
-            else
+            elif ! [[ "$@" =~ -6 ]]; then
                 warn "No default route found for ${PROVIDER}"
                 debug "$ROUTES"
             fi
         fi
-        OLD_STATE[$PROVIDER]="$STATE"
     done <<<"$WAN_CONF"
 }
 
 
-main() {
-    local OLD_ROUTES=''
-    local OLD_DEFAULT=''
-    while sleep $BAL_CHECK_INTERVAL; do
-        [[ $(get_lb_status) == "RUNNING" ]] || continue
+setup() {
+    debug "Starting in debug mode"
+}
 
-        stdout_to_var ROUTES get_nexthops
 
-        local NEW_ROUTES="${ROUTES[@]}"
-        local NEW_DEFAULT=$(ip route show default scope global)
+check_service() {
+    local ERR=0
 
-        [[ "$NEW_ROUTES" != "$OLD_ROUTES" || "$NEW_DEFAULT" != "$OLD_DEFAULT" ]] || continue
+    for SERVICE; do
+        declare -n OLD="OLD_${SERVICE^^}_STATUS"
+        declare -n NEW="NEW_${SERVICE^^}_STATUS"
 
-        if [[ "$NEW_ROUTES" ]]; then
-            log "Set default route to $NEW_ROUTES"
-            ip route replace default scope global $NEW_ROUTES
-        else
-            warn "No WAN detected, removing default route"
-            ip route delete default scope global
+        NEW=$(get_status "lbw-${SERVICE,,}")
+        if [[ "$NEW" != "$OLD" ]]; then
+            debug "${SERVICE} status changed from ${OLD} to ${NEW}"
+            test "${OLD}" == 'RUNNING' && warn "${SERVICE} service not available" || :
+            test "${NEW}" == 'RUNNING' && log "${SERVICE} service become available" || :
+            OLD="$NEW"
         fi
-        OLD_ROUTES=$NEW_ROUTES
-        OLD_DEFAULT=$(ip route show default scope global)
+
+        test "$NEW" == 'RUNNING' || ERR=$[ERR+$?]
+    done
+
+    return $ERR
+}
+
+
+main() {
+    local OLD_ROUTES OLD_DEFAULT
+    local OLD_ROUTES_IPV6 OLD_DEFAULT_IPV6
+    local NEW_VRF_STATUS OLD_VRF_STATUS='UNKNOWN'
+    local NEW_MONITOR_STATUS OLD_MONITOR_STATUS='UNKNOWN'
+
+    while sleep $CHECK_INTERVAL; do
+        check_service 'VRF' || continue
+
+        local ROUTES=($(get_nexthops -4))
+        local NEW_ROUTES="${ROUTES[@]}"
+        local NEW_DEFAULT=$(ip -4 route show default scope global)
+
+        if [[ "$NEW_ROUTES" != "$OLD_ROUTES" || "$NEW_DEFAULT" != "$OLD_DEFAULT" ]]; then
+            if [[ "$NEW_ROUTES" ]]; then
+                log "Set default route for IPv4 to $NEW_ROUTES"
+                cmd ip route replace default scope global $NEW_ROUTES
+            else
+                warn "No WAN detected for IPv4: removing default route"
+                cmd ip route delete default scope global
+            fi
+            debug "$(diff --label 'old routes' --label 'new routes' -u <(echo "$OLD_ROUTES") <(echo "$NEW_ROUTES"))"
+            debug "$(diff --label 'old default' --label 'new default' -u <(echo "$OLD_DEFAULT") <(echo "$NEW_DEFAULT"))"
+            OLD_ROUTES=$NEW_ROUTES
+            OLD_DEFAULT=$(ip -4 route show default scope global)
+        fi
+
+        if bool "$IPV6"; then
+            local ROUTES_IPV6=($(get_nexthops -6))
+            local NEW_ROUTES_IPV6="${ROUTES_IPV6[@]}"
+            local NEW_DEFAULT_IPV6=$(ip -6 route show default scope global)
+
+            if [[ "$NEW_ROUTES_IPV6" != "$OLD_ROUTES_IPV6" || "$NEW_DEFAULT_IPV6" != "$OLD_DEFAULT_IPV6" ]]; then
+                if [[ "$NEW_ROUTES_IPV6" ]]; then
+                    log "Set default route for IPv6 to $NEW_ROUTES_IPV6"
+                    cmd ip -6 route replace default scope global $NEW_ROUTES_IPV6
+                else
+                    warn "No WAN detected for IPv6, removing default route"
+                    cmd ip -6 route delete default scope global
+                fi
+                debug "$(diff --label 'old IPv6 routes' --label 'new IPv6 routes' -u <(echo "$OLD_ROUTES_IPV6") <(echo "$NEW_ROUTES_IPV6"))"
+                debug "$(diff --label 'old IPv6 default' --label 'new IPv6 default' -u <(echo "$OLD_DEFAULT_IPV6") <(echo "$NEW_DEFAULT_IPV6"))"
+                OLD_ROUTES_IPV6=$NEW_ROUTES_IPV6
+                OLD_DEFAULT_IPV6=$(ip -6 route show default scope global)
+            fi
+        fi
     done
 }
 
 
+setup
 main
 cleanup

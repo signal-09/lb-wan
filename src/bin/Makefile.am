@@ -1,4 +1,4 @@
-pkglibexec_SCRIPTS = lbw lbw-vrf lbw-monitor lbw-balancer
+pkglibexec_SCRIPTS = lbw lbw-vrf lbw-balancer
 
 commondir = $(pkglibexecdir)
 common_DATA = common.sh

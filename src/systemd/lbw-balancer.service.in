@@ -1,7 +1,6 @@
 [Unit]
 Description=Load Balancer for WAN
-After=network.target lbw-monitor.service
-Requires=lbw-monitor.service
+After=network.target lbw-vrf.service
 
 [Service]
 LogNamespace=lbw

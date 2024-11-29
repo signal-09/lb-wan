@@ -11,26 +11,35 @@ source "$COMMON" || exit 255
 
 # initialize
 setup() {
-    echo "LOADING" >"${RUNSTATEDIR}/lb-wan.status"
+    debug "Starting in debug mode"
+    set_status 'LOADING'
     setup_vrf_tables
     migrate_to_vrf
     forward_and_masq
-    echo "RUNNING" >"${RUNSTATEDIR}/lb-wan.status"
 }
 
 
 # cleanup on exit
 cleanup() {
-    echo "UNLOADING" >"${RUNSTATEDIR}/lb-wan.status"
+    set_status 'UNLOADING'
     local INTERFACES=$(awk '{ print $2 }' <<<"$WAN_CONF")
-    for INT in $LAN_INT $INTERFACES; do
-        log "Cleaning nat for interface ${INT}"
-        iptables -t nat -D POSTROUTING ${LAN_NET:+-s $LAN_NET} -o $INT -j MASQUERADE
-    done
+
+    # iptables
+    if bool "$IPTABLES"; then
+        for INT in $LAN_INT $INTERFACES; do
+            log "Cleaning nat for interface ${INT}"
+            cmd iptables -t nat -D POSTROUTING ${LAN_NET:+-s $LAN_NET} -o $INT -j MASQUERADE
+            if bool "$IPV6"; then
+                cmd ip6tables -t nat -D POSTROUTING -o $INT -j MASQUERADE
+            fi
+        done
+    fi
+
+    # networking
     while read PROVIDER ETHERNET WEIGHT PING_IPS; do
         local TABLE_NAME=${PROVIDER,,}
         for PRIORITY in $(ip rule show lookup "$TABLE_NAME" | awk -F: '{ print $1 }'); do
-            ip rule del priority "$PRIORITY"
+            cmd ip rule del priority "$PRIORITY"
         done
         local LEASE_PID="${RUNSTATEDIR}/dhclient.${ETHERNET}.pid"
         local LEASE_CONF="${SYSCONFDIR}/dhcp/dhclient.${ETHERNET}.conf"
@@ -39,26 +48,32 @@ cleanup() {
             kill -0 $PID 2>/dev/null && kill -TERM $PID || :
             rm "$LEASE_PID"
         fi
-        [[ -f "$LEASE_CONF" ]] && rm -f "$LEASE_CONF" || :
-        ip link set dev "$ETHERNET" nomaster
-        ip link del dev "$TABLE_NAME"
-        ip link set dev "$ETHERNET" down
-        ip addr flush dev "$ETHERNET"
-        ip route flush table "$TABLE_NAME"
+        test -f "$LEASE_CONF" && rm -f "$LEASE_CONF" || :
+        cmd ip link set dev "$ETHERNET" nomaster
+        cmd ip link del dev "$TABLE_NAME"
+        cmd ip link set dev "$ETHERNET" down
+        cmd ip addr flush dev "$ETHERNET"
+        cmd ip route flush table "$TABLE_NAME"
         local RT_TABLE="/etc/iproute2/rt_tables.d/${TABLE_NAME}.conf"
-        [[ -f "$RT_TABLE" ]] && rm -f "$RT_TABLE" || :
+        test -f "$RT_TABLE" && rm -f "$RT_TABLE" || :
         #if_up "$ETHERNET"
     done <<<"$WAN_CONF"
-    ip rule del l3mdev priority 1000
-    sysctl -w net.ipv4.tcp_l3mdev_accept=0
-    sysctl -w net.ipv4.udp_l3mdev_accept=0
+    cmd ip rule del l3mdev priority 1000
+    cmd sysctl -w net.ipv4.tcp_l3mdev_accept=0
+    cmd sysctl -w net.ipv4.udp_l3mdev_accept=0
     if [[ "$LAN_INT" ]]; then
-        sysctl -w net.ipv4.ip_forward="$IP_FORWARD"
-        sysctl -w net.ipv6.conf.all.forwarding="$IPV6_FORWARD"
+        cmd sysctl -w net.ipv4.ip_forward="$IP_FORWARD"
     fi
-    rm -f "${RUNSTATEDIR}/lb-wan.status"
+
+    # WAN status files
+    while read PROVIDER ETHERNET WEIGHT PING_IPS; do
+        clear_wan_status "$PROVIDER"
+    done <<<"$WAN_CONF"
+
+    clear_status
     exit
 }
+trap_pid
 trap cleanup INT TERM
 
 
@@ -78,17 +93,17 @@ setup_vrf_tables() {
 
 vrf_dhclient() {
     get_template 'dhclient.conf' >"$LEASE_CONF"
-    ip vrf exec "$TABLE_NAME" \
+    cmd ip vrf exec "$TABLE_NAME" \
         dhclient \
             -cf "$LEASE_CONF" \
             -pf "$LEASE_PID" \
             -lf "$LEASE_FILE" \
-            "$ETHERNET" &>/dev/null
+            "$ETHERNET"
 }
 
 # enslave interfaces to VRF
 migrate_to_vrf() {
-    ip rule add l3mdev priority 1000 || :
+    cmd ip rule add l3mdev priority 1000 || :
     while read PROVIDER ETHERNET WEIGHT PING_IPS; do
         local TABLE_NAME=${PROVIDER,,}
 
@@ -96,33 +111,34 @@ migrate_to_vrf() {
         if_down "$ETHERNET"
 
         # create VRF and routing table with same name
-        ip link add dev "$TABLE_NAME" type vrf table "$TABLE_NAME" || :
-        ip link set dev "$TABLE_NAME" up
+        cmd ip link add dev "$TABLE_NAME" type vrf table "$TABLE_NAME" || :
+        cmd ip link set dev "$TABLE_NAME" up
 
         # assign interface to VRF
-        ip link set dev "$ETHERNET" master "$TABLE_NAME"
-        ip link set dev "$ETHERNET" up
+        cmd ip link set dev "$ETHERNET" master "$TABLE_NAME"
+        cmd ip link set dev "$ETHERNET" up
 
         # use lease file as input for local routing
         local LEASE_FILE="${RUNSTATEDIR}/dhclient.${ETHERNET}.leases"
         local LEASE_PID="${RUNSTATEDIR}/dhclient.${ETHERNET}.pid"
         local LEASE_CONF="${SYSCONFDIR}/dhcp/dhclient.${ETHERNET}.conf"
-        [[ -f "$LEASE_FILE" ]] && rm "$LEASE_FILE" || :
+        test -f "$LEASE_FILE" && rm "$LEASE_FILE" || :
+
         vrf_dhclient
         local LEASE=$(get_last_lease "$LEASE_FILE")
         local LEASE_OPTIONS=$(get_lease_options "$LEASE")
         local GATEWAY=$(awk -F= '/routers/{ print $2 }' <<<"$LEASE_OPTIONS")
-        ip route replace default via "$GATEWAY" dev "$ETHERNET" table "$TABLE_NAME"
+        cmd ip route replace default via "$GATEWAY" dev "$ETHERNET" table "$TABLE_NAME"
 
         # ensure VRF networks be routable from local network
         local NETWORKS=$(ip route show dev "$ETHERNET" scope link type unicast table "$TABLE_NAME" | awk '{ print $1 }')
         for NETWORK in $NETWORKS; do
-            ip rule add to "$NETWORK" table "$TABLE_NAME"
+            cmd ip rule add to "$NETWORK" table "$TABLE_NAME"
         done
 
         # ensure local network be routable from VRF
         if [[ "$LAN_NET" && "$LAN_INT" ]]; then
-            ip route add "$LAN_NET" dev "$LAN_INT" scope link table "$TABLE_NAME" || :
+            cmd ip route add "$LAN_NET" dev "$LAN_INT" scope link table "$TABLE_NAME" || :
         fi
     done <<<"$WAN_CONF"
 }
@@ -130,25 +146,102 @@ migrate_to_vrf() {
 
 # enable IP forwarding and NAT
 forward_and_masq() {
-    sysctl -w net.ipv4.tcp_l3mdev_accept=1
-    sysctl -w net.ipv4.udp_l3mdev_accept=1
+    local INTERFACES=$(awk '{ print $2 }' <<<"$WAN_CONF")
+
+    # forwarding from sysctl
+    cmd sysctl -w net.ipv4.tcp_l3mdev_accept=1
+    cmd sysctl -w net.ipv4.udp_l3mdev_accept=1
     if [[ "$LAN_INT" ]]; then
-        sysctl -w net.ipv4.ip_forward=1
-        sysctl -w net.ipv6.conf.all.forwarding=1
+        IP_FORWARD=$(sysctl -n net.ipv4.ip_forward)
+        cmd sysctl -w net.ipv4.ip_forward=1
+        if bool "$IPV6"; then
+            for INT in $LAN_INT $INTERFACES; do
+                cmd sysctl -w "net.ipv6.conf.${INT}.forwarding=2"
+                cmd sysctl -w "net.ipv6.conf.${INT}.disable_ipv6=0"
+                cmd sysctl -w "net.ipv6.conf.${INT}.autoconf=1"
+                cmd sysctl -w "net.ipv6.conf.${INT}.accept_ra=2"
+            done
+        fi
     fi
 
-    # masquerade from every interfaces
-    INTERFACES=$(awk '{ print $2 }' <<<"$WAN_CONF")
-    for INT in $LAN_INT $INTERFACES; do
-        log "Natting interface ${INT}${LAN_NET:+ from $LAN_NET}"
-        local RULE="POSTROUTING ${LAN_NET:+-s $LAN_NET} -o $INT -j MASQUERADE"
-        ( iptables-save -t nat | grep -q -- "$RULE" ) || iptables -t nat -A $RULE
+    if bool "$IPTABLES"; then
+        # forwarding from iptables
+        if [[ "$LAN_INT" ]]; then
+            IPTABLES_FORWARD=$(iptables -S | awk '/FORWARD/{ print $3 }')
+            cmd iptables -P FORWARD ACCEPT
+            if bool "$IPV6"; then
+                IP6TABLES_FORWARD=$(ip6tables -S | awk '/FORWARD/{ print $3 }')
+                cmd ip6tables -P FORWARD ACCEPT
+            fi
+        fi
+
+        # masquerade from every interfaces
+        for INT in $LAN_INT $INTERFACES; do
+            log "Natting interface ${INT}${LAN_NET:+ from $LAN_NET}"
+            local RULE="POSTROUTING ${LAN_NET:+-s $LAN_NET} -o $INT -j MASQUERADE"
+            ( iptables-save -t nat | grep -q -- "$RULE" ) || iptables -t nat -A $RULE
+            if bool "$IPV6"; then
+                RULE="POSTROUTING -o $INT -j MASQUERADE"
+                ( ip6tables-save -t nat | grep -q -- "$RULE" ) || ip6tables -t nat -A $RULE
+            fi
+        done
+    fi
+}
+
+
+# ping with ethernet binding and return RTTs if succeded
+rtt_ping() {
+    local PROVIDER=$1
+    local TARGET=$2
+
+    ip vrf exec "${PROVIDER,,}" ping -4 -q -c1 -n -W${PING_TIMEOUT} ${TARGET} 2>/dev/null | awk -F/ '/^rtt/{ print $5 }'
+}
+
+
+# write status file based on reachability
+check_connectivity() {
+    local PROVIDER=$1
+    local TARGETS=$2
+    local REACHED=false
+
+    # check for reachability
+    for TGT in ${TARGETS//,/ }; do
+        if RTT=$(rtt_ping ${PROVIDER} ${TGT}); then
+            REACHED=true
+            break
+        fi
     done
+
+    # get last connection status
+    read LOSS OLD_RTT OLD_STATE < <(get_wan_status "$PROVIDER")
+    debug "${PROVIDER}: LOSS=${LOSS} RTT=${OLD_RTT} STATE=${OLD_STATE}"
+
+    # adapt status value
+    if [[ $REACHED == true ]]; then
+        if [[ $LOSS -gt 0 ]]; then
+            LOSS=$[LOSS - 1]
+            STATE=$OLD_STATE
+        else
+            STATE='UP'
+        fi
+    else
+        if [[ $LOSS -lt $MAX_PACKET_LOSS ]]; then
+            LOSS=$[LOSS + 1]
+            STATE=$OLD_STATE
+        else
+            STATE='DOWN'
+        fi
+    fi
+
+    # save status
+    test "$STATE" == "$OLD_STATE" || log "Declaring ${PROVIDER} ${STATE}"
+    set_wan_status "$PROVIDER" "$LOSS" "$RTT" "$STATE"
 }
 
 
 main() {
-    while sleep $VRF_CHECK_INTERVAL; do
+    set_status 'RUNNING'
+    while sleep $CHECK_INTERVAL; do
         while read PROVIDER ETHERNET WEIGHT PING_IPS; do
             local TABLE_NAME=${PROVIDER,,}
             local GATEWAY=$(ip -4 route show default dev "$ETHERNET" table "$TABLE_NAME" | awk '{ print $3 }')
@@ -158,9 +251,10 @@ main() {
                 local LEASE=$(get_last_lease "$LEASE_FILE")
                 local LEASE_OPTIONS=$(get_lease_options "$LEASE")
                 GATEWAY=$(awk -F= '/routers/{ print $2 }' <<<"$LEASE_OPTIONS")
-                log "Change default route for ${PROVIDER} via ${GATEWAY}"
-                ip route add default via "$GATEWAY" dev "$ETHERNET" table "$TABLE_NAME"
+                log "Reapply default route for ${PROVIDER} via ${GATEWAY}"
+                cmd ip route add default via "$GATEWAY" dev "$ETHERNET" table "$TABLE_NAME" || :
             fi
+            check_connectivity $PROVIDER $PING_IPS &
         done <<<"$WAN_CONF"
     done
 }

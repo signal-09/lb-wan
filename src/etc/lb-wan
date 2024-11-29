@@ -12,3 +12,9 @@ NETWORKING=auto
 
 # Comma or space separated DNS servers
 #NAMESERVERS="0.0.0.0"
+
+# Allow LB-Wan to manage iptables rules (e.g. FORWARD and NAT)
+#IPTABLES=yes
+
+# Setup IPv6 (EXPERIMENTAL)
+#IPV6=no

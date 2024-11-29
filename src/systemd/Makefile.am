@@ -4,7 +4,7 @@ AM_DISTCHECK_CONFIGURE_FLAGS = \
 if HAVE_SYSTEMD
 systemdsysconfdir = $(sysconfdir)/systemd
 systemdsysconf_DATA = journald@lbw.conf
-dist_systemdsystemunit_DATA = lbw-vrf.service lbw-monitor.service lbw-balancer.service
+dist_systemdsystemunit_DATA = lbw-vrf.service lbw-balancer.service
 
 all-am: $(dist_systemdsystemunit_DATA)
 	@touch *.service.in
