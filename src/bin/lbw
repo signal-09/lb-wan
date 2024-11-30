@@ -10,7 +10,7 @@ source "$COMMON" || exit 255
 
 
 HELP="Usage: ${SCRIPT} [OPTIONS] OBJECT { COMMAND | help }
-OBJECT := { service | wan | help }
+OBJECT := { status | service | wan | help }
 OPTIONS:
     -h, --help           Show this help
     -d, --debug          Run in debug mode (implies -f)
@@ -33,21 +33,27 @@ do_usage() {
 
 list_service_status() {
     echo "Services:"
-    for SERVICE in VRF Balancer; do
-        echo "- ${SERVICE}: $(get_service_status "${SERVICE}")"
+    do_service_list "$@" | while read LINE; do
+        echo "- ${LINE}"
     done
 }
 
 
 list_wan_status() {
     echo "WANs:"
-    while read PROVIDER ETHERNET WEIGHT PING_IPS; do
-        local TABLE_NAME=${PROVIDER,,}
-        read LOSS RTT STATE < <(get_wan_status "$PROVIDER")
-        echo "- ${PROVIDER}: ${STATE} (failures: ${LOSS}, latency: ${RTT})"
-    done <<<"$WAN_CONF"
+    do_wan_list "$@" | while read LINE; do
+        echo "- ${LINE}"
+    done
 }
 
+
+do_status() {
+    list_service_status
+    list_wan_status
+}
+
+
+## SERVICES
 
 get_service_pid() {
     local SERVICE=${1,,}
@@ -91,11 +97,31 @@ get_service_status() {
 }
 
 
+get_service_enabled() {
+    local SERVICE=${1,,}
+    local STATUS=$(systemctl is-enabled lbw-${SERVICE})
+
+    case "$STATUS" in
+    'enabled')
+        STATUS="${COLOR[LIGHT_GREEN]}${STATUS}${COLOR[RESET]}"
+        ;;
+    'disabled')
+        STATUS="${COLOR[YELLOW]}${STATUS}${COLOR[RESET]}"
+        ;;
+    esac
+
+    echo -e "$STATUS"
+}
+
+
 do_service_list() {
     local SERVICE
-    for SERVICE in VRF Balancer; do
+
+    [[ $# -gt 0 && ${1,,} != 'all' ]] || set -- 'VRF' 'Balancer'
+
+    for SERVICE; do
         local PID=$(get_service_pid "${SERVICE}")
-        echo "${SERVICE}${PID:+[${PID}]}: $(get_service_status "${SERVICE}")"
+        echo "${SERVICE}${PID:+[${PID}]}: $(get_service_status "${SERVICE}") ($(get_service_enabled "$SERVICE"))"
     done
 }
 
@@ -128,6 +154,28 @@ do_service_stop() {
 }
 
 
+do_service_enable() {
+    local SERVICE
+
+    [[ $# -gt 0 && ${1,,} != 'all' ]] || set -- 'VRF' 'Balancer'
+
+    for SERVICE; do
+        systemctl enable lbw-${SERVICE,,}
+    done
+}
+
+
+do_service_disable() {
+    local SERVICE
+
+    [[ $# -gt 0 && ${1,,} != 'all' ]] || set -- 'VRF' 'Balancer'
+
+    for SERVICE; do
+        systemctl disable lbw-${SERVICE,,}
+    done
+}
+
+
 do_service_status() {
     local SERVICE
 
@@ -140,6 +188,7 @@ do_service_status() {
 
 
 do_service() {
+    local SERVICE
     local CMD='list'
     local HELP="Usage: ${SCRIPT} service { COMMAND }
 COMMAND:
@@ -147,6 +196,7 @@ COMMAND:
     list                          List services and brief status
     start [ SERVICE... | all ]    Start services
     stop [ SERVICE... | all ]     Stop services
+    restart [ SERVICE... | all ]  Restart services
     status [ SERVICE... | all ]   Display status of services
     enable                        Enable LB-Wan services to be started at boot
     disable                       Disable LB-Wan services to be started at boot
@@ -159,7 +209,6 @@ SERVICE:
         shift
     fi
 
-    local SERVICE
     for SERVICE in "$@"; do
         case "${SERVICE,,}" in
         'vrf'|'balancer');;
@@ -174,14 +223,73 @@ SERVICE:
         do_service_start "$@"
     elif [[ x'stop' == x${CMD} ]]; then
         do_service_stop "$@"
+    elif [[ x'restart' == x${CMD}* ]]; then
+        do_service_stop "$@" && do_service_start "$@"
     elif [[ x'status' == x${CMD} ]]; then
         do_service_status "$@"
+    elif [[ x'enable' == x${CMD}* ]]; then
+        do_service_enable "$@"
+    elif [[ x'disable' == x${CMD}* ]]; then
+        do_service_disable "$@"
     elif [[ x'help' == x${CMD}* ]]; then
         do_help
     else
         fatal "Command \`${CMD}' is unknown, try \`${SCRIPT} service help'"
     fi
 }
+
+
+## WAN
+
+color_state() {
+    declare -A C=( [UP]=${COLOR[LIGHT_GREEN]} [DOWN]=${COLOR[LIGHT_RED]} )
+
+    echo -e "${C[$1]}$1${COLOR[RESET]}"
+}
+
+
+color_loss() {
+    local LOSS=$1
+    local C='LIGHT_RED'
+
+    if [[ $LOSS -eq 0 ]]; then
+        C='GREEN'
+    elif [[ $LOSS -lt $MAX_PACKET_LOSS ]]; then
+        C='YELLOW'
+    fi
+
+    echo -e "${COLOR[$C]}${LOSS}${COLOR[RESET]}"
+}
+
+
+do_wan_list() {
+    while read PROVIDER ETHERNET WEIGHT PING_IPS; do
+        local TABLE_NAME=${PROVIDER,,}
+        read LOSS RTT STATE < <(get_wan_status "$PROVIDER")
+        echo "${PROVIDER}: $(color_state "$STATE") (failures: $(color_loss "$LOSS"), latency: ${RTT})"
+    done <<<"$WAN_CONF"
+}
+
+
+do_wan() {
+    local CMD='list'
+    local HELP="Usage: ${SCRIPT} wan { COMMAND }
+COMMAND:
+    help               Show this help
+    list               List WANs and brief status"
+
+    if [[ $# -gt 0 ]]; then
+        CMD=$1
+        shift
+    fi
+
+    if [[ x'list' == x${CMD}* ]]; then
+        do_wan_list "$@"
+    else
+        fatal "Command \`${CMD}' is unknown, try \`${SCRIPT} wan help'"
+    fi
+}
+
 
 # parse command options
 OPTS=$(getopt -o hdft --long help,debug,foreground,timestamp,trace:: -q -- "$@") || fatal "Unrecognized options"
@@ -210,8 +318,12 @@ test $# -gt 0 || do_usage
 OBJ=$1
 shift
 
-if [[ x'service' == x${OBJ}* ]]; then
+if [[ x'status' == x${OBJ}* ]]; then
+    do_status "$@"
+elif [[ x'service' == x${OBJ}* ]]; then
     do_service "$@"
+elif [[ x'wan' == x${OBJ}* ]]; then
+    do_wan "$@"
 elif [[ x'help' == x${OBJ}* ]]; then
     do_help
 else
