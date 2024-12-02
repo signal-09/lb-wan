@@ -1,15 +1,13 @@
 #!/bin/bash
 
-set -eo pipefail
-
 # load shared components
-SCRIPT=$(realpath -- "${BASH_SOURCE[0]}")
-LIBDIR=$(dirname -- "$SCRIPT")
+SCRIPT=$(realpath "$0")
+LIBDIR=$(dirname "$SCRIPT")
 COMMON="${LIBDIR}/common.sh"
 source "$COMMON" || exit 255
 
 
-HELP="Usage: ${SCRIPT} [OPTIONS] OBJECT { COMMAND | help }
+HELP="Usage: ${__COMMAND__} [OPTIONS] OBJECT { COMMAND | help }
 OBJECT := { status | service | wan | help }
 OPTIONS:
     -h, --help           Show this help
@@ -134,7 +132,7 @@ do_service_start() {
     if [[ "$FOREGROUND" ]]; then
         test $# -eq 1 || fatal "Only one service at a time are allowed in foreground"
         SERVICE=${1,,}
-        exec -a "lbw-${SERVICE}" "${LIBDIR}/lbw-${SERVICE}"
+        exec -a "lbw-${SERVICE}" "${__DIR__}/lbw-${SERVICE}"
     fi
 
     for SERVICE; do
@@ -190,7 +188,7 @@ do_service_status() {
 do_service() {
     local SERVICE
     local CMD='list'
-    local HELP="Usage: ${SCRIPT} service { COMMAND }
+    local HELP="Usage: ${__COMMAND__} service { COMMAND }
 COMMAND:
     help                          Show this help
     list                          List services and brief status
@@ -213,7 +211,7 @@ SERVICE:
         case "${SERVICE,,}" in
         'vrf'|'balancer');;
         'all') test $# -eq 1 || fatal "\`all' meta service cannot be mixed with other services";;
-        *) fatal "Service \`${SERVICE}' is unknown, try \`${SCRIPT} service help'";;
+        *) fatal "Service \`${SERVICE}' is unknown, try \`${__COMMAND__} service help'";;
         esac
     done
 
@@ -234,7 +232,7 @@ SERVICE:
     elif [[ x'help' == x${CMD}* ]]; then
         do_help
     else
-        fatal "Command \`${CMD}' is unknown, try \`${SCRIPT} service help'"
+        fatal "Command \`${CMD}' is unknown, try \`${__COMMAND__} service help'"
     fi
 }
 
@@ -273,7 +271,7 @@ do_wan_list() {
 
 do_wan() {
     local CMD='list'
-    local HELP="Usage: ${SCRIPT} wan { COMMAND }
+    local HELP="Usage: ${__COMMAND__} wan { COMMAND }
 COMMAND:
     help               Show this help
     list               List WANs and brief status"
@@ -286,7 +284,7 @@ COMMAND:
     if [[ x'list' == x${CMD}* ]]; then
         do_wan_list "$@"
     else
-        fatal "Command \`${CMD}' is unknown, try \`${SCRIPT} wan help'"
+        fatal "Command \`${CMD}' is unknown, try \`${__COMMAND__} wan help'"
     fi
 }
 
@@ -327,5 +325,5 @@ elif [[ x'wan' == x${OBJ}* ]]; then
 elif [[ x'help' == x${OBJ}* ]]; then
     do_help
 else
-    fatal "Object \`${OBJ}' is unknown, try \`${SCRIPT} help'"
+    fatal "Object \`${OBJ}' is unknown, try \`${__COMMAND__} help'"
 fi

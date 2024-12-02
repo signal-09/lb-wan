@@ -192,6 +192,19 @@ OR
 > sudo lbw service stop
 ```
 
+### Status
+
+```shell
+> sudo lbw status
+Services:
+- VRF[3866053]: active (enabled)
+- Balancer[3866059]: active (enabled)
+WANs:
+- FTTH: UP (failures: 0, latency: 12.076)
+- FTTC: UP (failures: 0, latency: 16.501)
+- FWA: UP (failures: 0, latency: 21.229)
+```
+
 
 ## Suggestions
 

@@ -1,11 +1,9 @@
 #!/bin/bash
 
-set -eo pipefail
-
 # load shared components
-SCRIPT=$(realpath -- "${BASH_SOURCE[0]}")
-BINDIR=$(dirname -- "$SCRIPT")
-COMMON="${BINDIR}/common.sh"
+SCRIPT=$(realpath "$0")
+LIBDIR=$(dirname "$SCRIPT")
+COMMON="${LIBDIR}/common.sh"
 source "$COMMON" || exit 255
 
 
@@ -21,6 +19,7 @@ setup() {
 
 # cleanup on exit
 cleanup() {
+    trap - ERR
     set_status 'UNLOADING'
     local INTERFACES=$(awk '{ print $2 }' <<<"$WAN_CONF")
 
@@ -28,9 +27,9 @@ cleanup() {
     if bool "$IPTABLES"; then
         for INT in $LAN_INT $INTERFACES; do
             log "Cleaning nat for interface ${INT}"
-            cmd iptables -t nat -D POSTROUTING ${LAN_NET:+-s $LAN_NET} -o $INT -j MASQUERADE
+            cmd_no_fail iptables -t nat -D POSTROUTING ${LAN_NET:+-s $LAN_NET} -o $INT -j MASQUERADE
             if bool "$IPV6"; then
-                cmd ip6tables -t nat -D POSTROUTING -o $INT -j MASQUERADE
+                cmd_no_fail ip6tables -t nat -D POSTROUTING -o $INT -j MASQUERADE
             fi
         done
     fi
@@ -39,7 +38,7 @@ cleanup() {
     while read PROVIDER ETHERNET WEIGHT PING_IPS; do
         local TABLE_NAME=${PROVIDER,,}
         for PRIORITY in $(ip rule show lookup "$TABLE_NAME" | awk -F: '{ print $1 }'); do
-            cmd ip rule del priority "$PRIORITY"
+            cmd_no_fail ip rule del priority "$PRIORITY"
         done
         local LEASE_PID="${RUNSTATEDIR}/dhclient.${ETHERNET}.pid"
         local LEASE_CONF="${SYSCONFDIR}/dhcp/dhclient.${ETHERNET}.conf"
@@ -49,20 +48,20 @@ cleanup() {
             rm "$LEASE_PID"
         fi
         test -f "$LEASE_CONF" && rm -f "$LEASE_CONF" || :
-        cmd ip link set dev "$ETHERNET" nomaster
-        cmd ip link del dev "$TABLE_NAME"
-        cmd ip link set dev "$ETHERNET" down
-        cmd ip addr flush dev "$ETHERNET"
-        cmd ip route flush table "$TABLE_NAME"
+        cmd_no_fail ip link set dev "$ETHERNET" nomaster
+        cmd_no_fail ip link del dev "$TABLE_NAME"
+        cmd_no_fail ip link set dev "$ETHERNET" down
+        cmd_no_fail ip addr flush dev "$ETHERNET"
+        cmd_no_fail ip route flush table "$TABLE_NAME"
         local RT_TABLE="/etc/iproute2/rt_tables.d/${TABLE_NAME}.conf"
         test -f "$RT_TABLE" && rm -f "$RT_TABLE" || :
         #if_up "$ETHERNET"
     done <<<"$WAN_CONF"
-    cmd ip rule del l3mdev priority 1000
-    cmd sysctl -w net.ipv4.tcp_l3mdev_accept=0
-    cmd sysctl -w net.ipv4.udp_l3mdev_accept=0
+    cmd_no_fail ip rule del l3mdev priority 1000
+    cmd_no_fail sysctl -w net.ipv4.tcp_l3mdev_accept=0
+    cmd_no_fail sysctl -w net.ipv4.udp_l3mdev_accept=0
     if [[ "$LAN_INT" ]]; then
-        cmd sysctl -w net.ipv4.ip_forward="$IP_FORWARD"
+        cmd_no_fail sysctl -w net.ipv4.ip_forward="$IP_FORWARD"
     fi
 
     # WAN status files
@@ -103,7 +102,7 @@ vrf_dhclient() {
 
 # enslave interfaces to VRF
 migrate_to_vrf() {
-    cmd ip rule add l3mdev priority 1000 || :
+    cmd_no_fail ip rule add l3mdev priority 1000
     while read PROVIDER ETHERNET WEIGHT PING_IPS; do
         local TABLE_NAME=${PROVIDER,,}
 
@@ -111,7 +110,7 @@ migrate_to_vrf() {
         if_down "$ETHERNET"
 
         # create VRF and routing table with same name
-        cmd ip link add dev "$TABLE_NAME" type vrf table "$TABLE_NAME" || :
+        cmd_no_fail ip link add dev "$TABLE_NAME" type vrf table "$TABLE_NAME"
         cmd ip link set dev "$TABLE_NAME" up
 
         # assign interface to VRF
@@ -138,7 +137,7 @@ migrate_to_vrf() {
 
         # ensure local network be routable from VRF
         if [[ "$LAN_NET" && "$LAN_INT" ]]; then
-            cmd ip route add "$LAN_NET" dev "$LAN_INT" scope link table "$TABLE_NAME" || :
+            cmd_no_fail ip route add "$LAN_NET" dev "$LAN_INT" scope link table "$TABLE_NAME"
         fi
     done <<<"$WAN_CONF"
 }
@@ -252,7 +251,7 @@ main() {
                 local LEASE_OPTIONS=$(get_lease_options "$LEASE")
                 GATEWAY=$(awk -F= '/routers/{ print $2 }' <<<"$LEASE_OPTIONS")
                 log "Reapply default route for ${PROVIDER} via ${GATEWAY}"
-                cmd ip route add default via "$GATEWAY" dev "$ETHERNET" table "$TABLE_NAME" || :
+                cmd_no_fail ip route add default via "$GATEWAY" dev "$ETHERNET" table "$TABLE_NAME"
             fi
             check_connectivity $PROVIDER $PING_IPS &
         done <<<"$WAN_CONF"

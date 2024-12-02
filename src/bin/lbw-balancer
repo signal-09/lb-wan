@@ -1,18 +1,16 @@
 #!/bin/bash
 
-set -eo pipefail
-
 # load shared components
-SCRIPT=$(realpath -- "${BASH_SOURCE[0]}")
-BINDIR=$(dirname -- "$SCRIPT")
-COMMON="${BINDIR}/common.sh"
+SCRIPT=$(realpath "$0")
+LIBDIR=$(dirname "$SCRIPT")
+COMMON="${LIBDIR}/common.sh"
 source "$COMMON" || exit 255
 
 
 # delete balanced routes
 cleanup() {
     debug "Cleaning default route on exit"
-    cmd ip route delete default scope global
+    cmd_no_fail ip route delete default scope global
     exit
 }
 trap_pid
@@ -83,10 +81,10 @@ main() {
                 cmd ip route replace default scope global $NEW_ROUTES
             else
                 warn "No WAN detected for IPv4: removing default route"
-                cmd ip route delete default scope global || :
+                cmd_no_fail ip route delete default scope global
             fi
-            debug "$(diff --label 'old routes' --label 'new routes' -u <(echo "$OLD_ROUTES") <(echo "$NEW_ROUTES"))"
-            debug "$(diff --label 'old default' --label 'new default' -u <(echo "$OLD_DEFAULT") <(echo "$NEW_DEFAULT"))"
+            debug "$(diff --label 'old routes' --label 'new routes' -u <(echo "$OLD_ROUTES") <(echo "$NEW_ROUTES") || :)"
+            debug "$(diff --label 'old default' --label 'new default' -u <(echo "$OLD_DEFAULT") <(echo "$NEW_DEFAULT") || :)"
             OLD_ROUTES=$NEW_ROUTES
             OLD_DEFAULT=$(ip -4 route show default scope global)
         fi
@@ -102,10 +100,10 @@ main() {
                     cmd ip -6 route replace default scope global $NEW_ROUTES_IPV6
                 else
                     warn "No WAN detected for IPv6, removing default route"
-                    cmd ip -6 route delete default scope global || :
+                    cmd_no_fail ip -6 route delete default scope global
                 fi
-                debug "$(diff --label 'old IPv6 routes' --label 'new IPv6 routes' -u <(echo "$OLD_ROUTES_IPV6") <(echo "$NEW_ROUTES_IPV6"))"
-                debug "$(diff --label 'old IPv6 default' --label 'new IPv6 default' -u <(echo "$OLD_DEFAULT_IPV6") <(echo "$NEW_DEFAULT_IPV6"))"
+                debug "$(diff --label 'old IPv6 routes' --label 'new IPv6 routes' -u <(echo "$OLD_ROUTES_IPV6") <(echo "$NEW_ROUTES_IPV6") || :)"
+                debug "$(diff --label 'old IPv6 default' --label 'new IPv6 default' -u <(echo "$OLD_DEFAULT_IPV6") <(echo "$NEW_DEFAULT_IPV6") || :)"
                 OLD_ROUTES_IPV6=$NEW_ROUTES_IPV6
                 OLD_DEFAULT_IPV6=$(ip -6 route show default scope global)
             fi

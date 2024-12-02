@@ -1,9 +1,11 @@
 #!/bin/bash
 
+__SOURCE__=$(realpath "$0")
+__DIR__=$(dirname "$__SOURCE__")
+__COMMAND__=$(basename "$__SOURCE__")
+
 # load variables
 test -f '@sysconfdir@/default/lb-wan' && source '@sysconfdir@/default/lb-wan' || :
-
-SCRIPT=$(basename "$0")
 
 # set default values
 : ${DEBUG:=''}
@@ -17,8 +19,8 @@ SCRIPT=$(basename "$0")
 : ${SYSCONFDIR:='@sysconfdir@'}
 : ${RUNSTATEDIR:='@runstatedir@'}
 : ${WAN_BALANCER_CONF:="${SYSCONFDIR}/lb-wan.conf"}
-: ${PID_FILE:="${RUNSTATEDIR}/${SCRIPT}.pid"}
-: ${TRACE_FILE:="${RUNSTATEDIR}/${SCRIPT}.trace"}
+: ${PID_FILE:="${RUNSTATEDIR}/${__COMMAND__}.pid"}
+: ${TRACE_FILE:="${RUNSTATEDIR}/${__COMMAND__}.trace"}
 
 
 # avoid errors in file expansion
@@ -49,9 +51,9 @@ test ! -t 1 || declare -A COLOR=(
 
 # print messages to syslog or stderr if run in terminal
 test ! -t 0 || logger() {
-    local LEVEL="$4"
+    local LEVEL="$5"
     local STAMP START END
-    shift 4
+    local LINE="$6"
 
     if test -t 2; then
         if [[ "$LEVEL" == 'crit' ]]; then
@@ -66,20 +68,25 @@ test ! -t 0 || logger() {
         fi
     fi
 
-    test -z "$TIMESTAMP" || STAMP="$(date "+${DATE_FORMAT}") ${SCRIPT}[$$]: "
-
-    for MESSAGE; do
-        test -n "$MESSAGE" || continue
-        while IFS='' read -r LINE; do
-            echo -e "${STAMP}${START}${LINE}${END}"
-        done <<<"$MESSAGE"
-    done 1>&2
+    test -z "$TIMESTAMP" || STAMP="$(date "+${DATE_FORMAT}") ${__COMMAND__}[$$]: "
+    echo -e "${STAMP}${START}${LINE}${END}"
 }
+
+
+# syslog wrapper
 syslog() {
     local LEVEL="$1"
     shift
-    logger -t "$SCRIPT" -p "$LEVEL" "$@"
+    for MESSAGE; do
+        test -n "$MESSAGE" || continue
+        while IFS='' read -r LINE; do
+            logger --id=$$ -t "$__COMMAND__" -p "$LEVEL" "$LINE"
+        done <<<"$MESSAGE"
+    done
 }
+
+
+# logging messages
 fatal() { syslog 'crit' "$@"; exit 255; }
 error() { syslog 'crit' "$@"; }
 warn() { syslog 'warning' "$@"; }
@@ -87,9 +94,28 @@ log() { syslog 'notice' "$@"; }
 debug() { test -z "$DEBUG" || syslog 'debug' "$@"; }
 
 
+# track errors with line and command
+set -o errtrace -o errexit -o pipefail -o functrace
+internal_error() {
+    local _ERR=$1
+    local _BASH_COMMAND="${2:-$BASH_COMMAND}"
+    local _TRACEBACK=('Traceback:')
+
+    for ((i=${#BASH_SOURCE[@]}-2; i>=0; i--)); do
+        _TRACEBACK+=("  File \"${BASH_SOURCE[i+1]}\", line ${BASH_LINENO[i]}, in ${FUNCNAME[i+1]}")
+    done
+    _TRACEBACK+=(
+        "    Command: ${_BASH_COMMAND}"
+        "    Exit code: ${_ERR}"
+    )
+    error "${_TRACEBACK[@]}"
+}
+trap 'internal_error $?' ERR
+
+
 # exec command and log
 cmd() {
-    local ERR=0
+    local _ERR=0
     local CMD=$1
     local ARGS=''
     local STDOUT STDERR
@@ -103,7 +129,7 @@ cmd() {
 
     # redirect STDOUT/STDERR to variables for logging
     exec 4<><(:) 5<><(:)
-    $CMD "$@" 1>&4 2>&5 || ERR=$?
+    $CMD "$@" 1>&4 2>&5 || _ERR=$?
     printf '\0' 1>&4
     printf '\0' 1>&5
     read -r -d '' -u 4 STDOUT
@@ -111,14 +137,17 @@ cmd() {
     exec 4>&- 5>&-
 
     log "$STDOUT"
-    if [[ $ERR -eq 0 ]]; then
+    if [[ $_ERR -eq 0 || "$NO_FAIL" ]]; then
         warn "$STDERR"
     else
-        error "Command \`${CMD}' exited with error code: ${ERR}"
         error "$STDERR"
+        trap "internal_error $_ERR '${CMD}${ARGS}'" ERR
     fi
 
-    return $ERR
+    return $_ERR
+}
+cmd_no_fail() {
+    NO_FAIL=1 cmd "$@" || :
 }
 
 
@@ -128,9 +157,9 @@ trap_pid() {
     if [[ -f "$PID_FILE" ]]; then
         PID=$(cat "$PID_FILE")
         if kill -0 "$PID" &>/dev/null; then
-            fatal "${SCRIPT}[${PID}]: already running"
+            fatal "${__COMMAND__}[${PID}]: already running"
         else
-            warn "Replacing dead process ${SCRIPT}[${PID}]"
+            warn "Replacing dead process ${__COMMAND__}[${PID}]"
         fi
     fi
     echo "$$" >"$PID_FILE" && trap "rm -f '${PID_FILE}'" EXIT
@@ -147,14 +176,14 @@ bool() {
 
 
 set_status() {
-    local STATUS_FILE="${RUNSTATEDIR}/${SCRIPT}.status"
+    local STATUS_FILE="${RUNSTATEDIR}/${__COMMAND__}.status"
 
     echo "$1" >"$STATUS_FILE"
 }
 
 
 get_status() {
-    local STATUS_FILE="${RUNSTATEDIR}/${1:-$SCRIPT}.status"
+    local STATUS_FILE="${RUNSTATEDIR}/${1:-$__COMMAND__}.status"
 
     if [[ -f "$STATUS_FILE" ]]; then
         cat "$STATUS_FILE"
@@ -165,7 +194,7 @@ get_status() {
 
 
 clear_status() {
-    rm -f "${RUNSTATEDIR}/${SCRIPT}.status"
+    rm -f "${RUNSTATEDIR}/${__COMMAND__}.status"
 }
 
 
@@ -329,13 +358,13 @@ stdout_to_var() {
 if [[ "$TRACE" ]]; then
     eval "exec ${TRACE}>'${TRACE_FILE}'"
     BASH_XTRACEFD=$TRACE
-    set -x
+    set -o xtrace
 fi
 
 
 # avoid multiple instances
-if PID=$(pidof -x -o $$ "$SCRIPT"); then
-    fatal "${SCRIPT}[${PID// /,}]: already running"
+if PID=$(pidof -o $$ "$__COMMAND__"); then
+    fatal "${__COMMAND__}[${PID// /,}]: already running"
 fi
 
 
