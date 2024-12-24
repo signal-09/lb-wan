@@ -7,16 +7,29 @@ COMMON="${LIBDIR}/common.sh"
 source "$COMMON" || exit 255
 
 
-# delete balanced routes
+# VOID setup(VOID): VOID
+# initialize
+setup() {
+    debug "Starting in debug mode"
+    set_status 'LOADING'
+}
+
+
+# VOID cleanup(VOID): VOID
+# cleanup on exit
 cleanup() {
+    trap - ERR
     debug "Cleaning default route on exit"
     cmd_no_fail ip route delete default scope global
+    clear_status
     exit
 }
 trap_pid
 trap cleanup INT TERM
 
 
+# VOID get_nexthops(VOID): NEXTHOPS
+# stdout nexthops for active WANs
 get_nexthops() {
     while read PROVIDER ETHERNET WEIGHT PING_IPS; do
         local TABLE_NAME=${PROVIDER,,}
@@ -35,11 +48,8 @@ get_nexthops() {
 }
 
 
-setup() {
-    debug "Starting in debug mode"
-}
-
-
+# INT check_service(SERVICE*): VOID
+# check if specific lbw-SERVICE is running
 check_service() {
     local ERR=0
 
@@ -62,12 +72,15 @@ check_service() {
 }
 
 
-main() {
+# VOID run(VOID): VOID
+# main function
+run() {
     local OLD_ROUTES OLD_DEFAULT
     local OLD_ROUTES_IPV6 OLD_DEFAULT_IPV6
     local NEW_VRF_STATUS OLD_VRF_STATUS='UNKNOWN'
     local NEW_MONITOR_STATUS OLD_MONITOR_STATUS='UNKNOWN'
 
+    set_status 'RUNNING'
     while sleep $CHECK_INTERVAL; do
         check_service 'VRF' || continue
 
@@ -113,5 +126,5 @@ main() {
 
 
 setup
-main
+run
 cleanup

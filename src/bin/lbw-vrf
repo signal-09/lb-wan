@@ -7,6 +7,7 @@ COMMON="${LIBDIR}/common.sh"
 source "$COMMON" || exit 255
 
 
+# VOID setup(VOID): VOID
 # initialize
 setup() {
     debug "Starting in debug mode"
@@ -17,6 +18,7 @@ setup() {
 }
 
 
+# VOID cleanup(VOID): VOID
 # cleanup on exit
 cleanup() {
     trap - ERR
@@ -24,8 +26,9 @@ cleanup() {
     local INTERFACES=$(awk '{ print $2 }' <<<"$WAN_CONF")
 
     # iptables
+    debug "Cleaning iptables on exit"
     if bool "$IPTABLES"; then
-        for INT in $LAN_INT $INTERFACES; do
+        for INT in $INTERFACES; do
             log "Cleaning nat for interface ${INT}"
             cmd_no_fail iptables -t nat -D POSTROUTING ${LAN_NET:+-s $LAN_NET} -o $INT -j MASQUERADE
             if bool "$IPV6"; then
@@ -35,6 +38,7 @@ cleanup() {
     fi
 
     # networking
+    debug "Cleaning networking on exit"
     while read PROVIDER ETHERNET WEIGHT PING_IPS; do
         local TABLE_NAME=${PROVIDER,,}
         for PRIORITY in $(ip rule show lookup "$TABLE_NAME" | awk -F: '{ print $1 }'); do
@@ -55,6 +59,8 @@ cleanup() {
         cmd_no_fail ip route flush table "$TABLE_NAME"
         local RT_TABLE="/etc/iproute2/rt_tables.d/${TABLE_NAME}.conf"
         test -f "$RT_TABLE" && rm -f "$RT_TABLE" || :
+        local STATS_FILE="${RUNSTATEDIR}/lbw-${ETHERNET}.stats"
+        test -f "$STATS_FILE" && rm -f "$STATS_FILE" || :
         #if_up "$ETHERNET"
     done <<<"$WAN_CONF"
     cmd_no_fail ip rule del l3mdev priority 1000
@@ -65,6 +71,7 @@ cleanup() {
     fi
 
     # WAN status files
+    debug "Cleaning WAN status file on exit"
     while read PROVIDER ETHERNET WEIGHT PING_IPS; do
         clear_wan_status "$PROVIDER"
     done <<<"$WAN_CONF"
@@ -76,22 +83,26 @@ trap_pid
 trap cleanup INT TERM
 
 
+# VOID setup_vrf_tables(VOID): VOID
 # creat VRF tables
 setup_vrf_tables() {
     while read PROVIDER ETHERNET WEIGHT PING_IPS; do
         local TABLE_NAME=${PROVIDER,,}
         if ! grep -wq "${TABLE_NAME}\$" <<<"$RT_TABLES"; then
             local RT_TABLE="/etc/iproute2/rt_tables.d/${TABLE_NAME}.conf"
-            local NEW_TABLE=$(next_rt_table)
-            echo -e "${NEW_TABLE}\t${TABLE_NAME}" >"$RT_TABLE"
+            local TABLE_INDEX=$(next_rt_table)
+            echo -e "${TABLE_INDEX}\t${TABLE_NAME}" >"$RT_TABLE"
             RT_TABLES=$(read_rt_tables)
         fi
     done <<<"$WAN_CONF"
 }
 
 
+# VOID vrf_dhclient(VOID): VOID
+# run dhcp client for ETHERNET under VRF
 vrf_dhclient() {
     get_template 'dhclient.conf' >"$LEASE_CONF"
+    set_eth_stats "$ETHERNET"
     cmd ip vrf exec "$TABLE_NAME" \
         dhclient \
             -cf "$LEASE_CONF" \
@@ -100,6 +111,7 @@ vrf_dhclient() {
             "$ETHERNET"
 }
 
+# VOID migrate_to_vrf(VOID): VOID
 # enslave interfaces to VRF
 migrate_to_vrf() {
     cmd_no_fail ip rule add l3mdev priority 1000
@@ -143,6 +155,7 @@ migrate_to_vrf() {
 }
 
 
+# VOID forward_and_masq(VOID): VOID
 # enable IP forwarding and NAT
 forward_and_masq() {
     local INTERFACES=$(awk '{ print $2 }' <<<"$WAN_CONF")
@@ -175,20 +188,21 @@ forward_and_masq() {
         fi
 
         # masquerade from every interfaces
-        for INT in $LAN_INT $INTERFACES; do
-            log "Natting interface ${INT}${LAN_NET:+ from $LAN_NET}"
+        for INT in $INTERFACES; do
+            log "Natting interface ${INT}${LAN_NET:+" from $LAN_NET"}"
             local RULE="POSTROUTING ${LAN_NET:+-s $LAN_NET} -o $INT -j MASQUERADE"
-            ( iptables-save -t nat | grep -q -- "$RULE" ) || iptables -t nat -A $RULE
+            ( iptables-save -t nat | grep -q -- "$RULE" ) || cmd iptables -t nat -A $RULE
             if bool "$IPV6"; then
                 RULE="POSTROUTING -o $INT -j MASQUERADE"
-                ( ip6tables-save -t nat | grep -q -- "$RULE" ) || ip6tables -t nat -A $RULE
+                ( ip6tables-save -t nat | grep -q -- "$RULE" ) || cmd ip6tables -t nat -A $RULE
             fi
         done
     fi
 }
 
 
-# ping with ethernet binding and return RTTs if succeded
+# INT rtt_ping(PROVIDER, TARGET): RTT
+# stdout RTT of TARGET ping under PROVIDER VRF
 rtt_ping() {
     local PROVIDER=$1
     local TARGET=$2
@@ -197,7 +211,8 @@ rtt_ping() {
 }
 
 
-# write status file based on reachability
+# VOID check_connectivity(PROVIDER, TARGETS): VOID
+# write PROVIDER status file based on TARGETS reachability
 check_connectivity() {
     local PROVIDER=$1
     local TARGETS=$2
@@ -238,20 +253,34 @@ check_connectivity() {
 }
 
 
-main() {
+# VOID run(VOID): VOID
+# main function
+run() {
+    declare -A OLD_GATEWAY
+    declare -A OLD_ROUTES
+
     set_status 'RUNNING'
     while sleep $CHECK_INTERVAL; do
         while read PROVIDER ETHERNET WEIGHT PING_IPS; do
             local TABLE_NAME=${PROVIDER,,}
-            local GATEWAY=$(ip -4 route show default dev "$ETHERNET" table "$TABLE_NAME" | awk '{ print $3 }')
+            local ROUTES=$(ip -4 route show table "$TABLE_NAME")
+            local GATEWAY=$(awk '/^default/{ print $3 }' <<<"$ROUTES")
             if [[ -z "$GATEWAY" ]]; then
-                # FIXME: sometimes the default gateway disappear...
+                # FIXME: sometimes the default gateway disappear... why?
                 local LEASE_FILE="${RUNSTATEDIR}/dhclient.${ETHERNET}.leases"
                 local LEASE=$(get_last_lease "$LEASE_FILE")
                 local LEASE_OPTIONS=$(get_lease_options "$LEASE")
                 GATEWAY=$(awk -F= '/routers/{ print $2 }' <<<"$LEASE_OPTIONS")
+                [[ "$GATEWAY" != "${OLD_GATEWAY[$PROVIDER]}" || "$ROUTES" != "${OLD_ROUTES[$PROVIDER]}" ]] || continue
                 log "Reapply default route for ${PROVIDER} via ${GATEWAY}"
-                cmd_no_fail ip route add default via "$GATEWAY" dev "$ETHERNET" table "$TABLE_NAME"
+                if cmd ip route add default via "$GATEWAY" dev "$ETHERNET" table "$TABLE_NAME"; then
+                    unset OLD_GATEWAY[$PROVIDER]
+                    unset OLD_ROUTES[$PROVIDER]
+                else
+                    warn "$ROUTES"
+                    OLD_GATEWAY[$PROVIDER]="$GATEWAY"
+                    OLD_ROUTES[$PROVIDER]="$ROUTES"
+                fi
             fi
             check_connectivity $PROVIDER $PING_IPS &
         done <<<"$WAN_CONF"
@@ -260,5 +289,5 @@ main() {
 
 
 setup
-main
+run
 cleanup

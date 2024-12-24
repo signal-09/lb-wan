@@ -8,18 +8,19 @@ source "$COMMON" || exit 255
 
 
 HELP="Usage: ${__COMMAND__} [OPTIONS] OBJECT { COMMAND | help }
-OBJECT := { status | service | wan | help }
+OBJECT := { status | service | wan | balancer | help }
 OPTIONS:
-    -h, --help           Show this help
-    -d, --debug          Run in debug mode (implies -f)
-    -f, --foreground     Run in foreground mode
-    -t, --timestamp      Print timestamp in log lines
-        --trace[=FILE]   Print executed commands in a .trace file"
+    -h, --help             Show this help
+    -d, --debug            Run in debug mode (implies -f)
+    -f, --foreground       Run in foreground mode
+    -t, --timestamp        Print timestamp in log lines
+    -h, --human-readable   Print sizes in human readable format (e.g., 1KB 2GiB)
+        --trace[=FILE]     Print executed commands in a .trace file"
 
 
 do_help() {
     echo "$HELP"
-    exit
+    exit 0
 }
 
 
@@ -31,7 +32,7 @@ do_usage() {
 
 list_service_status() {
     echo "Services:"
-    do_service_list "$@" | while read LINE; do
+    do_service_list | while read LINE; do
         echo "- ${LINE}"
     done
 }
@@ -39,7 +40,7 @@ list_service_status() {
 
 list_wan_status() {
     echo "WANs:"
-    do_wan_list "$@" | while read LINE; do
+    do_wan_list | while read LINE; do
         echo "- ${LINE}"
     done
 }
@@ -53,6 +54,8 @@ do_status() {
 
 ## SERVICES
 
+# VOID get_service_pid(SERVICE): PID
+# stdout PID of SERVICE
 get_service_pid() {
     local SERVICE=${1,,}
     local PID_FILE="${RUNSTATEDIR}/lbw-${SERVICE}.pid"
@@ -73,9 +76,11 @@ get_service_pid() {
 }
 
 
+# VOID get_service_status(SERVICE): STATUS
+# stdout running STATUS of SERVICE
 get_service_status() {
     local SERVICE=${1,,}
-    local STATUS=$(systemctl is-active lbw-${SERVICE})
+    local STATUS=$(systemctl is-active lbw-${SERVICE} || :)
 
     case "$STATUS" in
     'active')
@@ -95,9 +100,11 @@ get_service_status() {
 }
 
 
+# VOID get_service_enabled(SERVICE): STATUS
+# stdout enabled STATUS of SERVICE
 get_service_enabled() {
     local SERVICE=${1,,}
-    local STATUS=$(systemctl is-enabled lbw-${SERVICE})
+    local STATUS=$(systemctl is-enabled lbw-${SERVICE} || :)
 
     case "$STATUS" in
     'enabled')
@@ -112,18 +119,20 @@ get_service_enabled() {
 }
 
 
+# VOID do_service_list(VOID): STATUS
+# stdout verbose STATUS of all services
 do_service_list() {
     local SERVICE
 
-    [[ $# -gt 0 && ${1,,} != 'all' ]] || set -- 'VRF' 'Balancer'
-
-    for SERVICE; do
+    for SERVICE in 'VRF' 'Balancer'; do
         local PID=$(get_service_pid "${SERVICE}")
         echo "${SERVICE}${PID:+[${PID}]}: $(get_service_status "${SERVICE}") ($(get_service_enabled "$SERVICE"))"
     done
 }
 
 
+# VOID do_service_start(ARGS*): VOID
+# start ARGS services (or all services if ARGS is omitted)
 do_service_start() {
     local SERVICE
 
@@ -141,6 +150,8 @@ do_service_start() {
 }
 
 
+# VOID do_service_stop(ARGS*): VOID
+# stop ARGS services (or all services if ARGS is omitted)
 do_service_stop() {
     local SERVICE
 
@@ -152,6 +163,8 @@ do_service_stop() {
 }
 
 
+# VOID do_service_enable(ARGS*): VOID
+# enable ARGS services (or all services if ARGS is omitted)
 do_service_enable() {
     local SERVICE
 
@@ -163,6 +176,8 @@ do_service_enable() {
 }
 
 
+# VOID do_service_disable(ARGS*): VOID
+# disable ARGS services (or all services if ARGS is omitted)
 do_service_disable() {
     local SERVICE
 
@@ -174,6 +189,8 @@ do_service_disable() {
 }
 
 
+# VOID do_service_status(ARGS*): STATUS
+# show ARGS services status (or all services if ARGS is omitted)
 do_service_status() {
     local SERVICE
 
@@ -185,8 +202,9 @@ do_service_status() {
 }
 
 
+# VOID do_service(ARGS*): VOID
+# exec service specific command ('list' if ARGS is omitted)
 do_service() {
-    local SERVICE
     local CMD='list'
     local HELP="Usage: ${__COMMAND__} service { COMMAND }
 COMMAND:
@@ -202,11 +220,9 @@ SERVICE:
     VRF                           Virtual Routing and Forwarding service
     Balancer                      Balancer service"
 
-    if [[ $# -gt 0 ]]; then
-        CMD=$1
-        shift
-    fi
+    test $# -eq 0 || { CMD=$1 && shift; }
 
+    local SERVICE
     for SERVICE in "$@"; do
         case "${SERVICE,,}" in
         'vrf'|'balancer');;
@@ -216,7 +232,8 @@ SERVICE:
     done
 
     if [[ x'list' == x${CMD}* ]]; then
-        do_service_list "$@"
+        test $# -eq 0 || fatal "garbage command options \`$*'"
+        do_service_list
     elif [[ x'start' == x${CMD} ]]; then
         do_service_start "$@"
     elif [[ x'stop' == x${CMD} ]]; then
@@ -264,11 +281,13 @@ do_wan_list() {
     while read PROVIDER ETHERNET WEIGHT PING_IPS; do
         local TABLE_NAME=${PROVIDER,,}
         read LOSS RTT STATE < <(get_wan_status "$PROVIDER")
-        echo "${PROVIDER}: $(color_state "$STATE") (failures: $(color_loss "$LOSS"), latency: ${RTT})"
+        echo "${PROVIDER}: $(color_state "$STATE") (weight: ${WEIGHT}, failures: $(color_loss "$LOSS"), latency: ${RTT})"
     done <<<"$WAN_CONF"
 }
 
 
+# VOID do_wan(ARGS*): VOID
+# exec WAN specific command ('list' if ARGS is omitted)
 do_wan() {
     local CMD='list'
     local HELP="Usage: ${__COMMAND__} wan { COMMAND }
@@ -276,21 +295,138 @@ COMMAND:
     help               Show this help
     list               List WANs and brief status"
 
-    if [[ $# -gt 0 ]]; then
-        CMD=$1
-        shift
-    fi
+    test $# -eq 0 || { CMD=$1 && shift; }
 
     if [[ x'list' == x${CMD}* ]]; then
-        do_wan_list "$@"
+        test $# -eq 0 || fatal "garbage command options \`$*'"
+        do_wan_list
+    elif [[ x'help' == x${CMD}* ]]; then
+        do_help
     else
         fatal "Command \`${CMD}' is unknown, try \`${__COMMAND__} wan help'"
     fi
 }
 
 
+## Balancer
+
+do_balancer_stats_show() {
+    local OUT=('Service:Weight:RX Bytes:RX Pkts:TX Bytes:TX Pkts:Total Bytes:Total Pkts')
+    local TOT=(0 0 0 0 0 0)
+    local EPOCH=$(date +%s)
+    declare -A VAL
+
+    while read PROVIDER ETHERNET WEIGHT PING_IPS; do
+        local rx_bytes rx_packets tx_bytes tx_packets
+        local RX_BYTES RX_PACKETS TX_BYTES TX_PACKETS
+        local STATS=('rx_bytes' 'rx_packets' 'tx_bytes' 'tx_packets')
+
+        get_eth_stats "$ETHERNET"
+
+        # get the smallest epoch within providers
+        [[ $epoch -ge $EPOCH ]] || EPOCH=$epoch
+
+        for STAT in ${STATS[@]}; do
+            read ${STAT^^} <<<$[$(read_eth_stat "$ETHERNET" "$STAT") - ${!STAT}]
+        done
+
+        local B_T=$[RX_BYTES+TX_BYTES]
+        local P_T=$[RX_PACKETS+TX_PACKETS]
+
+        TOT=($[${TOT[0]}+$RX_BYTES] $[${TOT[1]}+$RX_PACKETS] $[${TOT[2]}+$TX_BYTES] $[${TOT[3]}+$TX_PACKETS] $[${TOT[4]}+$B_T] $[${TOT[5]}+$P_T])
+        VAL[$PROVIDER]="$RX_BYTES:$RX_PACKETS:$TX_BYTES:$TX_PACKETS:$B_T:$P_T"
+        if [[ "$HUMAN" ]]; then
+            RX_BYTES="$(numfmt --to=iec-i "$RX_BYTES")B"
+            RX_PACKETS="$(numfmt --to=si "$RX_PACKETS")"
+            TX_BYTES="$(numfmt --to=iec-i "$TX_BYTES")B"
+            TX_PACKETS="$(numfmt --to=si "$TX_PACKETS")"
+            B_T="$(numfmt --to=iec-i "$B_T")B"
+            P_T="$(numfmt --to=si "$P_T")"
+        fi
+        OUT+=("${PROVIDER}:${WEIGHT}:${RX_BYTES}:${RX_PACKETS}:${TX_BYTES}:${TX_PACKETS}:${B_T}:${P_T}")
+    done <<<"$WAN_CONF"
+
+    local PER=('' '' '' '' '' '' '' '')
+    while read PROVIDER ETHERNET WEIGHT PING_IPS; do
+        PER[0]="${PER[0]:+${PER[0]}/}%"
+        for ((i=0;i<${#TOT[@]};i++)); do
+            IFS=':' read -r -a V <<<"${VAL[$PROVIDER]}"
+            PER[$i+2]="${PER[i+2]:+${PER[i+2]}/}$((${V[i]}*100/${TOT[i]}))"
+        done
+    done <<<"$WAN_CONF"
+
+    if [[ "$HUMAN" ]]; then
+        TOT[0]="$(numfmt --to=iec-i "${TOT[0]}")B"
+        TOT[1]="$(numfmt --to=si "${TOT[1]}")"
+        TOT[2]="$(numfmt --to=iec-i "${TOT[2]}")B"
+        TOT[3]="$(numfmt --to=si "${TOT[3]}")"
+        TOT[4]="$(numfmt --to=iec-i "${TOT[4]}")B"
+        TOT[5]="$(numfmt --to=si "${TOT[5]}")"
+    fi
+    OUT+=($(IFS=':'; echo "${PER[*]}"))
+    OUT+=('TOTAL::'$(IFS=':'; echo "${TOT[*]}"))
+
+    column -t -s ':' <(IFS=$'\n'; echo "${OUT[*]}")
+
+    local ELAPSED=$[$(date +%s)-EPOCH]
+    local DAYS=$[ELAPSED/60/60/24]
+    echo "Elapsed time: ${DAYS} days, $(date -ud "@${ELAPSED}" +%X)"
+}
+
+
+do_balancer_stats_reset() {
+    (IFS='|'; [[ $# -gt 0 && ! "|${*,,}|" =~ '|all|' ]]) || set --
+
+    while read PROVIDER ETHERNET WEIGHT PING_IPS; do
+        for ARG; do [[ ${PROVIDER,,} == ${ARG,,} || ${ETHERNET,,} == ${ARG,,} ]] || continue 2; done
+        set_eth_stats "$ETHERNET"
+    done <<<"$WAN_CONF"
+}
+
+
+do_balancer_stats() {
+    local CMD='show'
+    local HELP="Usage: ${__COMMAND__} balancer stats { COMMAND }
+COMMAND:
+    help               Show this help
+    show               Show balancer statistics
+    reset              Reset ethernet counters"
+
+    test $# -eq 0 || { CMD=$1 && shift; }
+
+    if [[ x'show' == x${CMD}* ]]; then
+        do_balancer_stats_show "$@"
+    elif [[ x'reset' == x${CMD}* ]]; then
+        do_balancer_stats_reset "$@"
+    elif [[ x'help' == x${CMD}* ]]; then
+        do_help
+    else
+        fatal "Command \`${CMD}' is unknown, try \`${__COMMAND__} balancer stats help'"
+    fi
+}
+
+
+do_balancer() {
+    local CMD='stats'
+    local HELP="Usage: ${__COMMAND__} balancer { COMMAND }
+COMMAND:
+    help               Show this help
+    stats|statistics   Balancer statistics"
+
+    test $# -eq 0 || { CMD=$1 && shift; }
+
+    if [[ x'stats' == x${CMD}* || x'statistics' == x${CMD}* ]]; then
+        do_balancer_stats "$@"
+    elif [[ x'help' == x${CMD}* ]]; then
+        do_help
+    else
+        fatal "Command \`${CMD}' is unknown, try \`${__COMMAND__} balancer help'"
+    fi
+}
+
+
 # parse command options
-OPTS=$(getopt -o hdft --long help,debug,foreground,timestamp,trace:: -q -- "$@") || fatal "Unrecognized options"
+OPTS=$(getopt -o hdftH --long help,debug,foreground,timestamp,human-readable,trace:: -q -- "$@") || fatal "Unrecognized options"
 eval set -- "$OPTS"
 unset OPTS
 
@@ -300,6 +436,7 @@ while [[ $# -gt 0 ]]; do
     -d|--debug) export DEBUG=1;&
     -f|--foregraund) export FOREGROUND=1;;
     -t|--timestamp) export TIMESTAMP=1;;
+    -H|--human-readable) export HUMAN=1;;
     --trace)
         export TRACE=3
         test -z "$2" || export TRACE_FILE="$2"
@@ -313,8 +450,7 @@ done
 
 test $# -gt 0 || do_usage
 
-OBJ=$1
-shift
+OBJ=$1 && shift
 
 if [[ x'status' == x${OBJ}* ]]; then
     do_status "$@"
@@ -322,6 +458,8 @@ elif [[ x'service' == x${OBJ}* ]]; then
     do_service "$@"
 elif [[ x'wan' == x${OBJ}* ]]; then
     do_wan "$@"
+elif [[ x'balancer' == x${OBJ}* ]]; then
+    do_balancer "$@"
 elif [[ x'help' == x${OBJ}* ]]; then
     do_help
 else
