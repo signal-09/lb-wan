@@ -1,10 +1,10 @@
 #!/bin/bash
 
 # load shared components
-SCRIPT=$(realpath "$0")
+SCRIPT=$(realpath "${BASH_SOURCE[0]}")
 LIBDIR=$(dirname "$SCRIPT")
 COMMON="${LIBDIR}/common.sh"
-source "$COMMON" || exit 255
+source "$COMMON" && init || exit 255
 
 
 # VOID setup(VOID): VOID
@@ -60,8 +60,8 @@ check_service() {
         NEW=$(get_status "lbw-${SERVICE,,}")
         if [[ "$NEW" != "$OLD" ]]; then
             debug "${SERVICE} status changed from ${OLD} to ${NEW}"
-            test "${OLD}" == 'RUNNING' && warn "${SERVICE} service not available" || :
-            test "${NEW}" == 'RUNNING' && log "${SERVICE} service become available" || :
+            warn "${SERVICE} service not available" when test "${NEW}" != 'RUNNING'
+            log "${SERVICE} service become available" when test "${NEW}" == 'RUNNING'
             OLD="$NEW"
         fi
 

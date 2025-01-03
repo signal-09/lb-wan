@@ -1,21 +1,10 @@
 #!/bin/bash
 
 # load shared components
-SCRIPT=$(realpath "$0")
+SCRIPT=$(realpath "${BASH_SOURCE[0]}")
 LIBDIR=$(dirname "$SCRIPT")
 COMMON="${LIBDIR}/common.sh"
-source "$COMMON" || exit 255
-
-
-HELP="Usage: ${__COMMAND__} [OPTIONS] OBJECT { COMMAND | help }
-OBJECT := { status | service | wan | balancer | help }
-OPTIONS:
-    -h, --help             Show this help
-    -d, --debug            Run in debug mode (implies -f)
-    -f, --foreground       Run in foreground mode
-    -t, --timestamp        Print timestamp in log lines
-    -h, --human-readable   Print sizes in human readable format (e.g., 1KB 2GiB)
-        --trace[=FILE]     Print executed commands in a .trace file"
+source "$COMMON" && init || exit 255
 
 
 do_help() {
@@ -25,10 +14,12 @@ do_help() {
 
 
 do_usage() {
-    log "$HELP"
+    stderr "$HELP"
     exit 255
 }
 
+
+## SERVICES
 
 list_service_status() {
     echo "Services:"
@@ -51,8 +42,6 @@ do_status() {
     list_wan_status
 }
 
-
-## SERVICES
 
 # VOID get_service_pid(SERVICE): PID
 # stdout PID of SERVICE
@@ -83,17 +72,17 @@ get_service_status() {
     local STATUS=$(systemctl is-active lbw-${SERVICE} || :)
 
     case "$STATUS" in
-    'active')
-        STATUS="${COLOR[LIGHT_GREEN]}${STATUS}${COLOR[RESET]}"
-        ;;
-    'failed')
-        STATUS="${COLOR[LIGHT_RED]}${STATUS}${COLOR[RESET]}"
-        ;&
-    'inactive')
-        if PID=$(pidof -x -o $$ "lbw-${SERVICE}"); then
-            STATUS="${COLOR[YELLOW]}running${COLOR[RESET]}"
-        fi
-        ;;
+        'active')
+            STATUS="${COLOR[LIGHT_GREEN]}${STATUS}${COLOR[RESET]}"
+            ;;
+        'failed')
+            STATUS="${COLOR[LIGHT_RED]}${STATUS}${COLOR[RESET]}"
+            ;&
+        'inactive')
+            if PID=$(pidof -x -o $$ "lbw-${SERVICE}"); then
+                STATUS="${COLOR[YELLOW]}running${COLOR[RESET]}"
+            fi
+            ;;
     esac
 
     echo -e "$STATUS"
@@ -107,12 +96,12 @@ get_service_enabled() {
     local STATUS=$(systemctl is-enabled lbw-${SERVICE} || :)
 
     case "$STATUS" in
-    'enabled')
-        STATUS="${COLOR[LIGHT_GREEN]}${STATUS}${COLOR[RESET]}"
-        ;;
-    'disabled')
-        STATUS="${COLOR[YELLOW]}${STATUS}${COLOR[RESET]}"
-        ;;
+        'enabled')
+            STATUS="${COLOR[LIGHT_GREEN]}${STATUS}${COLOR[RESET]}"
+            ;;
+        'disabled')
+            STATUS="${COLOR[YELLOW]}${STATUS}${COLOR[RESET]}"
+            ;;
     esac
 
     echo -e "$STATUS"
@@ -139,7 +128,7 @@ do_service_start() {
     [[ $# -gt 0 && ${1,,} != 'all' ]] || set -- 'VRF' 'Balancer'
 
     if [[ "$FOREGROUND" ]]; then
-        test $# -eq 1 || fatal "Only one service at a time are allowed in foreground"
+        fatal "Only one service at a time are allowed in foreground" when test $# -ne 1
         SERVICE=${1,,}
         exec -a "lbw-${SERVICE}" "${__DIR__}/lbw-${SERVICE}"
     fi
@@ -202,6 +191,11 @@ do_service_status() {
 }
 
 
+do_service_trace() {
+    journalctl --namespace=lbw "$@" || :
+}
+
+
 # VOID do_service(ARGS*): VOID
 # exec service specific command ('list' if ARGS is omitted)
 do_service() {
@@ -216,20 +210,12 @@ COMMAND:
     status [ SERVICE... | all ]   Display status of services
     enable                        Enable LB-Wan services to be started at boot
     disable                       Disable LB-Wan services to be started at boot
+    trace [ -- OPTIONS... ]       Query system log (journalctl [OPTIONS])
 SERVICE:
     VRF                           Virtual Routing and Forwarding service
     Balancer                      Balancer service"
 
     test $# -eq 0 || { CMD=$1 && shift; }
-
-    local SERVICE
-    for SERVICE in "$@"; do
-        case "${SERVICE,,}" in
-        'vrf'|'balancer');;
-        'all') test $# -eq 1 || fatal "\`all' meta service cannot be mixed with other services";;
-        *) fatal "Service \`${SERVICE}' is unknown, try \`${__COMMAND__} service help'";;
-        esac
-    done
 
     if [[ x'list' == x${CMD}* ]]; then
         test $# -eq 0 || fatal "garbage command options \`$*'"
@@ -246,6 +232,8 @@ SERVICE:
         do_service_enable "$@"
     elif [[ x'disable' == x${CMD}* ]]; then
         do_service_disable "$@"
+    elif [[ x'trace' == x${CMD}* ]]; then
+        do_service_trace "$@"
     elif [[ x'help' == x${CMD}* ]]; then
         do_help
     else
@@ -425,43 +413,58 @@ COMMAND:
 }
 
 
-# parse command options
-OPTS=$(getopt -o hdftH --long help,debug,foreground,timestamp,human-readable,trace:: -q -- "$@") || fatal "Unrecognized options"
-eval set -- "$OPTS"
-unset OPTS
+do_object() {
+    local OPTS
+    local HELP="Usage: ${__COMMAND__} [OPTIONS] OBJECT { COMMAND | help }
+OBJECT := { status | service | wan | balancer | help }
+OPTIONS:
+    -h, --help             Show this help
+    -d, --debug            Run in debug mode (implies -f)
+    -f, --foreground       Run in foreground mode
+    -t, --timestamp        Print timestamp in log lines
+    -h, --human-readable   Print sizes in human readable format (e.g., 1KB 2GiB)
+        --trace[=FILE]     Print executed commands in a .trace file"
 
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-    -h|--help) do_help;;
-    -d|--debug) export DEBUG=1;&
-    -f|--foregraund) export FOREGROUND=1;;
-    -t|--timestamp) export TIMESTAMP=1;;
-    -H|--human-readable) export HUMAN=1;;
-    --trace)
-        export TRACE=3
-        test -z "$2" || export TRACE_FILE="$2"
+    # parse command options
+    OPTS=$(getopt -o hdftH --long help,debug,foreground,timestamp,human-readable,trace:: -q -- "$@") || fatal "Invalid options"
+    eval set -- "$OPTS"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help) do_help ;;
+            -d|--debug) export DEBUG=1 ;&
+            -f|--foreground) export FOREGROUND=1 ;;
+            -t|--timestamp) export TIMESTAMP=1 ;;
+            -H|--human-readable) export HUMAN=1 ;;
+            --trace)
+                export TRACE=3
+                test -z "$2" || export TRACE_FILE="$2"
+                shift
+                ;;
+            --) shift && break ;;
+            *) fatal "Unrecognized option \`$1'" ;;
+        esac
         shift
-        ;;
-    --) shift; break;;
-    *) fatal "Unrecognized option \`$1'";;
-    esac
-    shift
-done
+    done
 
-test $# -gt 0 || do_usage
+    test $# -gt 0 || do_usage
 
-OBJ=$1 && shift
+    OBJ=$1 && shift
 
-if [[ x'status' == x${OBJ}* ]]; then
-    do_status "$@"
-elif [[ x'service' == x${OBJ}* ]]; then
-    do_service "$@"
-elif [[ x'wan' == x${OBJ}* ]]; then
-    do_wan "$@"
-elif [[ x'balancer' == x${OBJ}* ]]; then
-    do_balancer "$@"
-elif [[ x'help' == x${OBJ}* ]]; then
-    do_help
-else
-    fatal "Object \`${OBJ}' is unknown, try \`${__COMMAND__} help'"
-fi
+    if [[ x'status' == x${OBJ}* ]]; then
+        do_status "$@"
+    elif [[ x'service' == x${OBJ}* ]]; then
+        do_service "$@"
+    elif [[ x'wan' == x${OBJ}* ]]; then
+        do_wan "$@"
+    elif [[ x'balancer' == x${OBJ}* ]]; then
+        do_balancer "$@"
+    elif [[ x'help' == x${OBJ}* ]]; then
+        do_help
+    else
+        fatal "Object \`${OBJ}' is unknown, try \`${__COMMAND__} help'"
+    fi
+}
+
+
+do_object "$@"

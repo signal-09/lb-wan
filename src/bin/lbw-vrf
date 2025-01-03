@@ -1,10 +1,10 @@
 #!/bin/bash
 
 # load shared components
-SCRIPT=$(realpath "$0")
+SCRIPT=$(realpath "${BASH_SOURCE[0]}")
 LIBDIR=$(dirname "$SCRIPT")
 COMMON="${LIBDIR}/common.sh"
-source "$COMMON" || exit 255
+source "$COMMON" && init || exit 255
 
 
 # VOID setup(VOID): VOID
@@ -248,7 +248,7 @@ check_connectivity() {
     fi
 
     # save status
-    test "$STATE" == "$OLD_STATE" || log "Declaring ${PROVIDER} ${STATE}"
+    log "Declaring ${PROVIDER} ${STATE}" when test "$STATE" != "$OLD_STATE"
     set_wan_status "$PROVIDER" "$LOSS" "$RTT" "$STATE"
 }
 
@@ -273,7 +273,7 @@ run() {
                 GATEWAY=$(awk -F= '/routers/{ print $2 }' <<<"$LEASE_OPTIONS")
                 [[ "$GATEWAY" != "${OLD_GATEWAY[$PROVIDER]}" || "$ROUTES" != "${OLD_ROUTES[$PROVIDER]}" ]] || continue
                 log "Reapply default route for ${PROVIDER} via ${GATEWAY}"
-                if cmd ip route add default via "$GATEWAY" dev "$ETHERNET" table "$TABLE_NAME"; then
+                if cmd_no_fatal ip route add default via "$GATEWAY" dev "$ETHERNET" table "$TABLE_NAME"; then
                     unset OLD_GATEWAY[$PROVIDER]
                     unset OLD_ROUTES[$PROVIDER]
                 else

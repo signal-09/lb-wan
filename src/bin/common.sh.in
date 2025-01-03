@@ -49,6 +49,13 @@ test ! -t 1 || declare -A COLOR=(
 )
 
 
+# VOID stderr(ARGS*): VOID
+# stderr ARGS*
+stderr() {
+    echo -e "$@" 1>&2
+}
+
+
 # print messages to syslog or stderr if run in terminal
 test ! -t 0 || logger() {
     local LEVEL="$5"
@@ -62,6 +69,9 @@ test ! -t 0 || logger() {
         elif [[ "$LEVEL" == 'warning' ]]; then
             START="${COLOR[YELLOW]}"
             END="${COLOR[RESET]}"
+        #elif [[ "$LEVEL" == 'notice' ]]; then
+        #    START="${COLOR[LIGHT_GREEN]}"
+        #    END="${COLOR[RESET]}"
         elif [[ "$LEVEL" == 'debug' ]]; then
             START="${COLOR[DARK_GRAY]}"
             END="${COLOR[RESET]}"
@@ -69,37 +79,98 @@ test ! -t 0 || logger() {
     fi
 
     test -z "$TIMESTAMP" || STAMP="$(date "+${DATE_FORMAT}") ${__COMMAND__}[$$]: "
-    echo -e "${STAMP}${START}${LINE}${END}"
+    stderr "${STAMP}${START}${LINE}${END}"
 }
 
 
-# syslog wrapper
+# INT condition('when'|'unless', 'test'|'exec', ARGS*): VOID
+# check ARGS* condition (test or exec) and return true (0) or false (1)
+condition() {
+    test $# -gt 0 || return 0
+
+    local CONDITION="${1:-always}"
+    local OPERATION="${2:-noop}"
+
+    if ! shift 2; then
+        error 'Insufficient number of parameters:'
+        internal_error 255 "condition $*"
+    elif [[ $# -eq 0 ]]; then
+        error 'Empty conditions:'
+        internal_error 255 "condition ${CONDITION} ${OPERATION}"
+    fi
+
+    case "$CONDITION" in
+        'always') ;;
+        'when'|'unless')
+            case "$OPERATION" in
+                'test')
+                    test "$CONDITION" == 'when' || set -- ! "$@"
+                    test "$@" || return 1
+                    ;;
+                'exec')
+                    if [[ "$CONDITION" == 'when' ]]; then
+                        "$@"
+                    else
+                        ! "$@"
+                    fi &>/dev/null || return 1
+                    ;;
+                *)
+                    error "Unknown operation \'${OPERATION}':"
+                    internal_error 255 "condition ${CONDITION} ${OPERATION} $*"
+                    ;;
+            esac
+            ;;
+        *)
+            error "Unknown condition \'${CONDITION}':"
+            internal_error 255 "condition ${CONDITION} ${OPERATION} $*"
+            ;;
+    esac
+
+    return 0
+}
+
+
+# INT syslog(LEVEL, MESSAGE, [CONDITIONS*]): VOID
+# syslog wrapper (if CONDITIONS is true or VOID)
 syslog() {
+    local ERR=0
     local LEVEL="$1"
-    shift
-    for MESSAGE; do
-        test -n "$MESSAGE" || continue
-        while IFS='' read -r LINE; do
-            logger --id=$$ -t "$__COMMAND__" -p "$LEVEL" "$LINE"
-        done <<<"$MESSAGE"
-    done
+    local MESSAGE="$2"
+    local CONDITION="${3:-always}"
+    local OPERATION="${4:-noop}"
+    shift 2
+
+    condition "$@" || return 1
+
+    while IFS='' read -r LINE; do
+        test -n "$LINE" || continue
+        logger --id=$$ -t "$__COMMAND__" -p "$LEVEL" "$LINE"
+    done <<<"$MESSAGE"
+
+    return 0
 }
 
 
 # logging messages
-fatal() { syslog 'crit' "$@"; exit 255; }
-error() { syslog 'crit' "$@"; }
-warn() { syslog 'warning' "$@"; }
-log() { syslog 'notice' "$@"; }
-debug() { test -z "$DEBUG" || syslog 'debug' "$@"; }
+fatal() { syslog 'crit' "$@" && exit 255 || :; }
+error() { syslog 'crit' "$@" || :; }
+warn() { syslog 'warning' "$@" || :; }
+notice() { syslog 'notice' "$@" || :; }
+# FIXME: info syslog level not usable due to dhclient Spam
+log() { syslog 'notice' "$@" || :; }
+debug() { test -z "$DEBUG" || syslog 'debug' "$@" || :; }
 
 
-# track errors with line and command
-set -o errtrace -o errexit -o pipefail -o functrace
+# VOID internal_error(ERR, [BASH_COMMAND]): TRACEBACK
+# stdout TRACEBACK for BASH_COMMAND that caused ERR exit code
 internal_error() {
-    local _ERR=$1
+    local _ERR=${1:-0}
+    test $_ERR -gt 0 || return
+
     local _BASH_COMMAND="${2:-$BASH_COMMAND}"
     local _TRACEBACK=('Traceback:')
+    local IFS=$'\n'
+    local i
 
     for ((i=${#BASH_SOURCE[@]}-2; i>=0; i--)); do
         _TRACEBACK+=("  File \"${BASH_SOURCE[i+1]}\", line ${BASH_LINENO[i]}, in ${FUNCNAME[i+1]}")
@@ -108,14 +179,14 @@ internal_error() {
         "    Command: ${_BASH_COMMAND}"
         "    Exit code: ${_ERR}"
     )
-    error "${_TRACEBACK[@]}"
+    error "${_TRACEBACK[*]}"
+    test $# -eq 1 || exit $_ERR
 }
-trap 'internal_error $?' ERR
 
 
 # INT cmd(CMD, ARGS*): VOID
 # exec CMD with ARGS and log stdout/stderr
-# return exitcode of CMD
+# return exitcode of CMD if NO_FAIL
 cmd() {
     local _ERR=0
     local CMD=$1
@@ -139,14 +210,18 @@ cmd() {
     exec 4>&- 5>&-
 
     log "$STDOUT"
-    if [[ $_ERR -eq 0 || "$NO_FAIL" ]]; then
-        warn "$STDERR"
-    else
-        error "$STDERR"
-        trap "internal_error $_ERR '${CMD}${ARGS}'" ERR
-    fi
+    error "$STDERR"
 
+    test $_ERR -eq 0 -o -n "$NO_FAIL" || internal_error $_ERR "${CMD}${ARGS}"
     return $_ERR
+}
+
+
+# INT cmd_no_fatal(CMD, ARGS*): VOID
+# exec CMD with ARGS and log stdout/stderr
+# return exitcode of CMD
+cmd_no_fatal() {
+    NO_FAIL=1 cmd "$@"
 }
 
 
@@ -165,23 +240,22 @@ trap_pid() {
     local PID
     if [[ -f "$PID_FILE" ]]; then
         PID=$(cat "$PID_FILE")
-        if kill -0 "$PID" &>/dev/null; then
-            fatal "${__COMMAND__}[${PID}]: already running"
-        else
-            warn "Replacing dead process ${__COMMAND__}[${PID}]"
-        fi
+        fatal "${__COMMAND__}[${PID}]: already running" when exec kill -0 "$PID"
+        warn "Replacing dead process ${__COMMAND__}[${PID}]"
     fi
-    echo "$$" >"$PID_FILE" && trap "rm -f '${PID_FILE}'" EXIT
+    echo "$$" >"$PID_FILE"
+    trap "rm -f '${PID_FILE}'" EXIT
 }
 
 
 # INT bool(VALUE): VOID
 # return 0 (True) or 1 (False) if VALUE is boolean int/str
 bool() {
-    case "${1,,}" in
-    '1'|'yes'|'true') return 0;;
-    '0'|'no'|'false') return 1;;
-    *) fatal "Boolean value \`${1}' not allowed";;
+    local VALUE="${1:-0}"
+    case "${VALUE,,}" in
+        '1'|'yes'|'true') return 0 ;;
+        '0'|'no'|'false') return 1 ;;
+        *) fatal "Boolean value \`${VALUE}' not allowed" ;;
     esac
 }
 
@@ -257,7 +331,7 @@ get_eth_stats() {
     local ETHERNET="$1"
     local STATS_FILE="${RUNSTATEDIR}/lbw-${ETHERNET}.stats"
 
-    test -f "$STATS_FILE" || error "Statistic file for ${ETHERNET} not present"
+    fatal "Statistic file for ${ETHERNET} not present" unless test -f "$STATS_FILE"
     source "$STATS_FILE"
 }
 
@@ -336,11 +410,14 @@ get_lease_options() {
 # VOID get_template(TEMPLATE): CONTENT
 # stdout TEMPLATE with expanded variables
 get_template() {
-    local TEMPLATE="/usr/libexec/lb-wan/templates/${1}.in"
+    local TEMPLATE="$1"
+    local TEMPLATE_FILE="/usr/libexec/lb-wan/templates/${TEMPLATE}.in"
     local CONTENT
+    local ERR=0
 
-    test -f "$TEMPLATE" || fatal "Template file for \`${1}' not found"
-    read -d '' -r CONTENT <"$TEMPLATE"
+    fatal "Template file for \`${TEMPLATE}' not found" unless test -f "$TEMPLATE_FILE"
+    read -d '' -r CONTENT <"$TEMPLATE_FILE" || ERR=$?
+    fatal "Error while reading \`${TEMPLATE}' template" when test $ERR -ne 1
     echo "${CONTENT@P}"
 }
 
@@ -351,9 +428,9 @@ get_nameservers() {
     local ETHERNET="$1"
 
     case "$NETWORKING" in
-    'ifupdown')
-        ifquery "$ETHERNET" | awk -F': ' '/^dns-nameserver/{ print $2 }'
-        ;;
+        'ifupdown')
+            ifquery "$ETHERNET" | awk -F': ' '/^dns-nameserver/{ print $2 }'
+            ;;
     esac
 }
 
@@ -377,19 +454,21 @@ next_rt_table() {
         INDEX=$[TABLE+1]
     done <<<"$RT_TABLES"
 
-    test $INDEX -lt 253 || fatal "No available free table space for iproute2 rt_tables"
+    fatal "No available free table space for iproute2 rt_tables (got ${INDEX})" when test $INDEX -gt 252
+
     echo "$INDEX"
 }
 
 
+# VOID if_managed(ETHERNET): NETWORKING
 # check if interface is managed by the tool
 if_managed() {
     local ETHERNET="$1"
 
     case "$NETWORKING" in
-    'ifupdown') ( ifquery -l | grep -q "^${ETHERNET}$" ) && echo "$NETWORKING" || echo 'manual';;
-    'netplan') test $(netplan get "ethernets.${ETHERNET}") != 'null' && echo "$NETWORKING" || echo 'manual';;
-    *) echo 'manual';;
+        'ifupdown') ( ifquery -l | grep -q "^${ETHERNET}$" ) && echo "$NETWORKING" || echo 'manual' ;;
+        'netplan') test $(netplan get "ethernets.${ETHERNET}") != 'null' && echo "$NETWORKING" || echo 'manual' ;;
+        *) echo 'manual' ;;
     esac
 }
 
@@ -401,14 +480,14 @@ if_up() {
     local NETWORKING=$(if_managed "$ETHERNET")
 
     case "$NETWORKING" in
-    'ifupdown') cmd ifup "$ETHERNET";;
-    'netplan')
-        # TODO:
-        # netplan get "ethernets.${ETHERNET}"
-        # create /tmp/custom/etc/netplan
-        # netplan apply --state /tmp/custom ???
-        ;;
-    'manual') warn "Unable to bring up ${ETHERNET} if NETWORKING='manual'";;
+        'ifupdown') cmd ifup "$ETHERNET" ;;
+        'netplan')
+            # TODO:
+            # netplan get "ethernets.${ETHERNET}"
+            # create /tmp/custom/etc/netplan
+            # netplan apply --state /tmp/custom ???
+            ;;
+        'manual') warn "Unable to bring up ${ETHERNET} if NETWORKING='manual'" ;;
     esac
 }
 
@@ -420,11 +499,11 @@ if_down() {
     local NETWORKING=$(if_managed "$ETHERNET")
 
     case "$NETWORKING" in
-    'ifupdown') cmd ifdown "$ETHERNET";;
-    'netplan'|'manual')
-        cmd ip link set dev "$ETHERNET" down
-        cmd ip addr flush dev "$ETHERNET"
-        ;;
+        'ifupdown') cmd ifdown "$ETHERNET" ;;
+        'netplan'|'manual')
+            cmd ip link set dev "$ETHERNET" down
+            cmd ip addr flush dev "$ETHERNET"
+            ;;
     esac
 }
 
@@ -445,61 +524,59 @@ stdout_to_var() {
 }
 
 
-# enable tracing to file
-if [[ "$TRACE" ]]; then
-    eval "exec ${TRACE}>'${TRACE_FILE}'"
-    BASH_XTRACEFD=$TRACE
-    set -o xtrace
-fi
+# VOID init(VOID): VOID
+init() {
+    # track errors with line and command
+    set -o errtrace -o errexit -o pipefail -o functrace
+    trap 'internal_error $?' ERR
 
-
-# avoid multiple instances
-if PID=$(pidof -o $$ "$__COMMAND__"); then
-    fatal "${__COMMAND__}[${PID// /,}]: already running"
-fi
-
-
-# identify networking
-if [[ "$NETWORKING" == 'auto' ]]; then
-    if [[ -f /etc/network/interfaces && $(type -ft ifquery) == 'file' ]] && ifquery --state &>/dev/null; then
-        NETWORKING=ifupdown
-    elif [[ -d /etc/netplan && $(type -ft netplan) == 'file' ]] && netplan status &>/dev/null; then
-        NETWORKING=netplan
+    # enable tracing to file
+    if [[ "$TRACE" ]]; then
+        eval "exec ${TRACE}>'${TRACE_FILE}'"
+        BASH_XTRACEFD=$TRACE
+        set -o xtrace
     fi
-fi
-if [[ "$NETWORKING" == 'ifupdown' ]]; then
-    test $(type -ft ifquery) == 'file' || fatal "\`ifupdown' tool not found, change NETWORKING in /etc/default/lb-wan.conf"
-    ifquery --state &>/dev/null || fatal "\`ifupdown' not configured"
-elif [[ "$NETWORKING" == 'netplan' ]]; then
-    test $(type -ft netplan) == 'file' || fatal "\`netplan' tool not found, change NETWORKING in /etc/default/lb-wan.conf"
-    netplan status &>/dev/null || fatal "\`netplan' not configured"
-elif [[ "$NETWORKING" != 'manual' ]]; then
-    fatal "Unsupported network configuration tool"
-fi
 
+    # avoid multiple instances
+    if PID=$(pidof -o $$ "$__COMMAND__"); then
+        fatal "${__COMMAND__}[${PID// /,}]: already running"
+    fi
 
-# load config file
-if [[ -f "$WAN_BALANCER_CONF" ]]; then
+    # identify networking
+    if [[ "$NETWORKING" == 'auto' ]]; then
+        if [[ -f /etc/network/interfaces && $(type -ft ifquery) == 'file' ]] && ifquery --state &>/dev/null; then
+            NETWORKING=ifupdown
+        elif [[ -d /etc/netplan && $(type -ft netplan) == 'file' ]] && netplan status &>/dev/null; then
+            NETWORKING=netplan
+        fi
+    fi
+    if [[ "$NETWORKING" == 'ifupdown' ]]; then
+        fatal "\`ifupdown' tool not found, change NETWORKING in /etc/default/lb-wan.conf" unless test $(type -ft ifquery) == 'file'
+        fatal "\`ifupdown' not configured" unless exec ifquery --state
+    elif [[ "$NETWORKING" == 'netplan' ]]; then
+        fatal "\`netplan' tool not found, change NETWORKING in /etc/default/lb-wan.conf" unless test $(type -ft netplan) == 'file'
+        fatal "\`netplan' not configured" unless exec netplan get
+    elif [[ "$NETWORKING" != 'manual' ]]; then
+        fatal 'Unsupported network configuration tool'
+    fi
+
+    # load config file
+    fatal "Config file \`${WAN_BALANCER_CONF}' not present" unless test -f "$WAN_BALANCER_CONF"
     WAN_CONF=$(grep -vE '^$|^#|^LAN' "$WAN_BALANCER_CONF")
-    if ! [[ "$WAN_CONF" ]]; then
-        fatal "Config file \`${WAN_BALANCER_CONF}' is empty"
-    fi
+    fatal "Config file \`${WAN_BALANCER_CONF}' is empty" when test -z "$WAN_CONF"
     LAN_INT=$(awk '/^LAN[[:space:]]/{ print $2 }' "$WAN_BALANCER_CONF")
     if [[ "$LAN_INT" ]]; then
         LAN_NET=$(ip route show dev "$LAN_INT" scope link | awk '{ print $1 }')
         LAN_DNS=($(get_nameservers "$LAN_INT"))
     fi
-else
-    fatal "Config file \`${WAN_BALANCER_CONF}' not present"
-fi
 
+    # normalize DNS
+    : ${NAMESERVERS:="${LAN_DNS[@]}"}
+    : ${NAMESERVERS:='8.8.8.8,8.8.4.4'}
+    NAMESERVERS=($(tr ':;,' ' ' <<<"$NAMESERVERS"))
+    NAMESERVERS="${NAMESERVERS[@]}"
+    NAMESERVERS="${NAMESERVERS// /, }"
 
-# normalize DNS
-: ${NAMESERVERS:="${LAN_DNS[@]}"}
-: ${NAMESERVERS:='8.8.8.8,8.8.4.4'}
-NAMESERVERS=($(tr ':;,' ' ' <<<"$NAMESERVERS"))
-NAMESERVERS="${NAMESERVERS[@]}"
-NAMESERVERS="${NAMESERVERS// /, }"
-
-# load rt_tables
-RT_TABLES=$(read_rt_tables)
+    # load rt_tables
+    RT_TABLES=$(read_rt_tables)
+}
