@@ -10,6 +10,7 @@ source "$COMMON" && init || exit 255
 # VOID setup(VOID): VOID
 # initialize
 setup() {
+    log "Setup..."
     debug "Starting in debug mode"
     set_status 'LOADING'
 }
@@ -18,6 +19,7 @@ setup() {
 # VOID cleanup(VOID): VOID
 # cleanup on exit
 cleanup() {
+    log "Cleanup..."
     trap - ERR
     debug "Cleaning default route on exit"
     cmd_no_fail ip route delete default scope global
@@ -28,20 +30,31 @@ trap_pid
 trap cleanup INT TERM
 
 
-# VOID get_nexthops(VOID): NEXTHOPS
+# VOID get_nexthops(IP): NEXTHOPS
 # stdout nexthops for active WANs
+# WARN: do not subshell (e.g. `NH=$(get_nexthops -4)`), use assign instead
+# (e.g. `assign NH=get_nexthops -4`) to prevent loss of global variable changes
+declare -A PROVIDER_ROUTES
 get_nexthops() {
-    while read PROVIDER ETHERNET WEIGHT PING_IPS; do
+    [[ $BASH_SUBSHELL -eq 0 ]] || internal_error 255 "\'get_nexthops' called using subshell"
+    local IP="${1:--4}"
+    local PROVIDER ETHERNET WEIGHT PING_IPS ENABLED
+    while read PROVIDER ETHERNET WEIGHT PING_IPS ENABLED; do
+        bool "${ENABLED:-true}" || continue
         local TABLE_NAME=${PROVIDER,,}
         read LOSS RTT STATE < <(get_wan_status "$PROVIDER")
         if [[ "$STATE" == UP ]]; then
-            local ROUTES=$(ip "$@" route show dev "$ETHERNET" table "$TABLE_NAME")
+            local ROUTES=$(ip "$@" route show dev "$ETHERNET" table "$TABLE_NAME" | sed -e 's/ expires \d*\w*//')
             local GATEWAY=$(awk '/^default/{ print $3 }' <<<"$ROUTES" | head -1)
             if [[ "$GATEWAY" ]]; then
                 echo "nexthop via ${GATEWAY} dev ${ETHERNET} weight ${WEIGHT}"
-            elif ! [[ "$@" =~ -6 ]]; then
-                warn "No default route found for ${PROVIDER}"
-                debug "$ROUTES"
+            fi
+            if [[ "$ROUTES" != "${PROVIDER_ROUTES[$PROVIDER$IP]}" ]]; then
+                PROVIDER_ROUTES[$PROVIDER$IP]="$ROUTES"
+                if [[ -z "$GATEWAY" ]]; then
+                    warn "No default route found for ${PROVIDER} (IP${IP/-/v})"
+                    debug "$ROUTES"
+                fi
             fi
         fi
     done <<<"$WAN_CONF"
@@ -75,16 +88,18 @@ check_service() {
 # VOID run(VOID): VOID
 # main function
 run() {
+    local ROUTES ROUTES_IPV6
     local OLD_ROUTES OLD_DEFAULT
     local OLD_ROUTES_IPV6 OLD_DEFAULT_IPV6
     local NEW_VRF_STATUS OLD_VRF_STATUS='UNKNOWN'
     local NEW_MONITOR_STATUS OLD_MONITOR_STATUS='UNKNOWN'
 
+    log "Run..."
     set_status 'RUNNING'
     while sleep $CHECK_INTERVAL; do
         check_service 'VRF' || continue
 
-        local ROUTES=($(get_nexthops -4))
+        assign -a ROUTES=get_nexthops -4
         local NEW_ROUTES="${ROUTES[@]}"
         local NEW_DEFAULT=$(ip -4 route show default scope global)
 
@@ -103,7 +118,7 @@ run() {
         fi
 
         if bool "$IPV6"; then
-            local ROUTES_IPV6=($(get_nexthops -6))
+            assign -a ROUTES_IPV6=get_nexthops -6
             local NEW_ROUTES_IPV6="${ROUTES_IPV6[@]}"
             local NEW_DEFAULT_IPV6=$(ip -6 route show default scope global)
 

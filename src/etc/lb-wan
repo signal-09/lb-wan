@@ -17,4 +17,4 @@ NETWORKING=auto
 #IPTABLES=yes
 
 # Setup IPv6 (EXPERIMENTAL)
-#IPV6=no
+IPV6=yes

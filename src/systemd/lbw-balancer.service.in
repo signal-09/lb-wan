@@ -5,6 +5,7 @@ After=network.target lbw-vrf.service
 [Service]
 LogNamespace=lbw
 ExecStart=@pkglibexecdir@/lbw-balancer
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartPreventExitStatus=0 255
 

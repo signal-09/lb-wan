@@ -120,47 +120,91 @@ do_service_list() {
 }
 
 
+# VOID check_list(ARGS, LIST): VOID
+# check that every element in ARGS exists in LIST
+# or set ARGS=LIST if ARGS contains "all"
+check_list() {
+    declare -n CHECK_ARGS="$1"
+    declare -n CHECK_LIST="$2"
+
+    local IFS='|'
+    local OPTS="|${CHECK_LIST[*],,}|"
+
+    local OPT
+    for OPT in "${CHECK_ARGS[@],,}"; do
+        if [[ "$OPT" == 'all' ]]; then
+            CHECK_ARGS=("${CHECK_LIST[@]}")
+            return
+        elif ! [[ "$OPTS" =~ "|${OPT}|" ]]; then
+            fatal "Value \`${OPT}' not allowed (must be one of [${CHECK_LIST[*]}])"
+        fi
+    done
+}
+
+
+# VOID systemctl_action(ACTION, SERVICE): VOID
+systemctl_action() {
+    local ACTION="$1"
+    local SERVICE="$2"
+
+    if [[ "$FOREGROUND" && "$ACTION" == 'start' ]]; then
+        exec -a "lbw-${SERVICE}" "${__DIR__}/lbw-${SERVICE}"
+    else
+        cmd systemctl ${ACTION} lbw-${SERVICE}
+    fi
+}
+
+
+# VOID do_service_action(ACTION, ARGS, LIST): VOID
+do_service_action() {
+    local ACTION="$1"
+    declare -n A="$2"
+    declare -n L="$3"
+
+    fatal "No service provided" when test ${#A[@]} -eq 0
+
+    check_list A L
+
+    fatal "Only one service at a time are allowed in foreground" when test -n "$FOREGROUND" -a ${#A[@]} -gt 1
+
+    local SERVICE
+    for SERVICE in "${A[@],,}"; do
+        systemctl_action "$ACTION" "$SERVICE"
+    done
+}
+
+
 # VOID do_service_start(ARGS*): VOID
 # start ARGS services (or all services if ARGS is omitted)
 do_service_start() {
-    local SERVICE
+    local ARGS=("$@")
+    local LIST=('VRF' 'Balancer')
 
-    [[ $# -gt 0 && ${1,,} != 'all' ]] || set -- 'VRF' 'Balancer'
-
-    if [[ "$FOREGROUND" ]]; then
-        fatal "Only one service at a time are allowed in foreground" when test $# -ne 1
-        SERVICE=${1,,}
-        exec -a "lbw-${SERVICE}" "${__DIR__}/lbw-${SERVICE}"
-    fi
-
-    for SERVICE; do
-        systemctl start lbw-${SERVICE,,}
-    done
+    do_service_action start ARGS LIST
 }
 
 
 # VOID do_service_stop(ARGS*): VOID
 # stop ARGS services (or all services if ARGS is omitted)
 do_service_stop() {
-    local SERVICE
+    local ARGS=("$@")
+    local LIST=('VRF' 'Balancer')
 
-    [[ $# -gt 0 && ${1,,} != 'all' ]] || set -- 'VRF' 'Balancer'
-
-    for SERVICE; do
-        systemctl stop lbw-${SERVICE,,}
-    done
+    do_service_action stop ARGS LIST
 }
 
 
 # VOID do_service_enable(ARGS*): VOID
 # enable ARGS services (or all services if ARGS is omitted)
 do_service_enable() {
+    fatal "No service provided" when test $# -eq 0
+
+    local ARGS=("$@")
+    check_list ARGS 'VRF' 'Balancer'
+
     local SERVICE
-
-    [[ $# -gt 0 && ${1,,} != 'all' ]] || set -- 'VRF' 'Balancer'
-
-    for SERVICE; do
-        systemctl enable lbw-${SERVICE,,}
+    for SERVICE in "${ARGS[@]}"; do
+        cmd systemctl enable lbw-${SERVICE,,}
     done
 }
 
@@ -168,12 +212,14 @@ do_service_enable() {
 # VOID do_service_disable(ARGS*): VOID
 # disable ARGS services (or all services if ARGS is omitted)
 do_service_disable() {
+    fatal "No service provided" when test $# -eq 0
+
+    local ARGS=("$@")
+    check_list ARGS 'VRF' 'Balancer'
+
     local SERVICE
-
-    [[ $# -gt 0 && ${1,,} != 'all' ]] || set -- 'VRF' 'Balancer'
-
-    for SERVICE; do
-        systemctl disable lbw-${SERVICE,,}
+    for SERVICE in "${ARGS[@]}"; do
+        cmd systemctl disable lbw-${SERVICE,,}
     done
 }
 
@@ -225,7 +271,8 @@ SERVICE:
     elif [[ x'stop' == x${CMD} ]]; then
         do_service_stop "$@"
     elif [[ x'restart' == x${CMD}* ]]; then
-        do_service_stop "$@" && do_service_start "$@"
+        do_service_stop "$@"
+        do_service_start "$@"
     elif [[ x'status' == x${CMD} ]]; then
         do_service_status "$@"
     elif [[ x'enable' == x${CMD}* ]]; then
@@ -266,11 +313,72 @@ color_loss() {
 
 
 do_wan_list() {
-    while read PROVIDER ETHERNET WEIGHT PING_IPS; do
-        local TABLE_NAME=${PROVIDER,,}
-        read LOSS RTT STATE < <(get_wan_status "$PROVIDER")
-        echo "${PROVIDER}: $(color_state "$STATE") (weight: ${WEIGHT}, failures: $(color_loss "$LOSS"), latency: ${RTT})"
+    local PROVIDER ETHERNET WEIGHT PING_IPS ENABLED
+    while read PROVIDER ETHERNET WEIGHT PING_IPS ENABLED; do
+        if bool "${ENABLED:-true}"; then
+            local LOSS RTT STATE
+            read LOSS RTT STATE < <(get_wan_status "$PROVIDER")
+            stdout "${PROVIDER}: $(color_state "$STATE") (weight: ${WEIGHT}, failures: $(color_loss "$LOSS"), latency: ${RTT})"
+        else
+            stdout "${PROVIDER}: ${COLOR[YELLOW]}DISABLED${COLOR[RESET]}"
+        fi
     done <<<"$WAN_CONF"
+}
+
+
+# VOID dump_conf(ARGS*): CONF
+# stdout column (:) separated wan/lan configuration
+dump_conf() {
+    local HEADER="#service:device:weight:ping-ips:[enabled]"
+    local ARG
+
+    [[ $# -gt 0 ]] || set -- 'all'
+
+    local -a TABLE=("$HEADER")
+    : ${DEFAULT:=true}
+    local PROVIDER ETHERNET WEIGHT PING_IPS ENABLED
+    while read PROVIDER ETHERNET WEIGHT PING_IPS ENABLED; do
+        case "$PROVIDER" in
+            \#*) continue ;;
+            LAN)
+                TABLE+=("${PROVIDER}:${ETHERNET}")
+                ;;
+            *)
+                for ARG; do
+                    if [[ "${ARG,,}" == 'all' || "${PROVIDER,,}" == "${ARG,,}" ]]; then
+                        ENABLED="$DEFAULT"
+                        break
+                    fi
+                done
+                TABLE+=("${PROVIDER}:${ETHERNET}:${WEIGHT}:${PING_IPS}:${ENABLED:-true}")
+                ;;
+        esac
+    done <"$WAN_BALANCER_CONF"
+
+    local IFS=$'\n'
+    echo "${TABLE[*]}" | column -ts:
+}
+
+
+# VOID do_wan_enable(ARGS*): VOID
+# enable ARGS providers (or all providers if ARGS is omitted)
+do_wan_enable() {
+    DEFAULT='true' dump_conf "$@" >"${WAN_BALANCER_CONF}.tmp"
+    mv "${WAN_BALANCER_CONF}.tmp" "$WAN_BALANCER_CONF"
+
+    local PID=$(get_pid "lbw-balancer")
+    test -z "$PID" || kill -HUP $PID
+}
+
+
+# VOID do_wan_disable(ARGS*): VOID
+# disable ARGS providers (or all providers if ARGS is omitted)
+do_wan_disable() {
+    DEFAULT='false' dump_conf "$@" >"${WAN_BALANCER_CONF}.tmp"
+    mv "${WAN_BALANCER_CONF}.tmp" "$WAN_BALANCER_CONF"
+
+    local PID=$(get_pid "lbw-balancer")
+    test -z "$PID" || kill -HUP $PID
 }
 
 
@@ -280,14 +388,20 @@ do_wan() {
     local CMD='list'
     local HELP="Usage: ${__COMMAND__} wan { COMMAND }
 COMMAND:
-    help               Show this help
-    list               List WANs and brief status"
+    help                          Show this help
+    list                          List WANs and brief status
+    enable [ SERVICE... | all ]   Enable WAN providers
+    disable [ SERVICE... | all ]  Disable WAN providers"
 
     test $# -eq 0 || { CMD=$1 && shift; }
 
     if [[ x'list' == x${CMD}* ]]; then
         test $# -eq 0 || fatal "garbage command options \`$*'"
         do_wan_list
+    elif [[ x'enable' == x${CMD} ]]; then
+        do_wan_enable "$@"
+    elif [[ x'disable' == x${CMD} ]]; then
+        do_wan_disable "$@"
     elif [[ x'help' == x${CMD}* ]]; then
         do_help
     else
@@ -422,7 +536,7 @@ OPTIONS:
     -d, --debug            Run in debug mode (implies -f)
     -f, --foreground       Run in foreground mode
     -t, --timestamp        Print timestamp in log lines
-    -h, --human-readable   Print sizes in human readable format (e.g., 1KB 2GiB)
+    -H, --human-readable   Print sizes in human readable format (e.g., 1KB 2GiB)
         --trace[=FILE]     Print executed commands in a .trace file"
 
     # parse command options

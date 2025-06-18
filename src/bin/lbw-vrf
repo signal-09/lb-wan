@@ -10,6 +10,7 @@ source "$COMMON" && init || exit 255
 # VOID setup(VOID): VOID
 # initialize
 setup() {
+    log "Setup..."
     debug "Starting in debug mode"
     set_status 'LOADING'
     setup_vrf_tables
@@ -21,9 +22,11 @@ setup() {
 # VOID cleanup(VOID): VOID
 # cleanup on exit
 cleanup() {
+    log "Cleanup..."
     trap - ERR
     set_status 'UNLOADING'
     local INTERFACES=$(awk '{ print $2 }' <<<"$WAN_CONF")
+    local PROVIDER ETHERNET WEIGHT PING_IPS ENABLED
 
     # iptables
     debug "Cleaning iptables on exit"
@@ -39,7 +42,7 @@ cleanup() {
 
     # networking
     debug "Cleaning networking on exit"
-    while read PROVIDER ETHERNET WEIGHT PING_IPS; do
+    while read PROVIDER ETHERNET WEIGHT PING_IPS ENABLED; do
         local TABLE_NAME=${PROVIDER,,}
         for PRIORITY in $(ip rule show lookup "$TABLE_NAME" | awk -F: '{ print $1 }'); do
             cmd_no_fail ip rule del priority "$PRIORITY"
@@ -67,12 +70,20 @@ cleanup() {
     cmd_no_fail sysctl -w net.ipv4.tcp_l3mdev_accept=0
     cmd_no_fail sysctl -w net.ipv4.udp_l3mdev_accept=0
     if [[ "$LAN_INT" ]]; then
+        if bool "$IPTABLES"; then
+            cmd_no_fail iptables -D FORWARD -s "$LAN_NET" -j ACCEPT
+            cmd_no_fail iptables -D FORWARD -d "$LAN_NET" -j ACCEPT
+            if bool "$IPV6"; then
+                cmd_no_fail ip6tables -P FORWARD "$IP6TABLES_FORWARD"
+            fi
+        fi
+        # restore original net.ipv4.ip_forward
         cmd_no_fail sysctl -w net.ipv4.ip_forward="$IP_FORWARD"
     fi
 
     # WAN status files
     debug "Cleaning WAN status file on exit"
-    while read PROVIDER ETHERNET WEIGHT PING_IPS; do
+    while read PROVIDER ETHERNET WEIGHT PING_IPS ENABLED; do
         clear_wan_status "$PROVIDER"
     done <<<"$WAN_CONF"
 
@@ -86,7 +97,8 @@ trap cleanup INT TERM
 # VOID setup_vrf_tables(VOID): VOID
 # creat VRF tables
 setup_vrf_tables() {
-    while read PROVIDER ETHERNET WEIGHT PING_IPS; do
+    local PROVIDER ETHERNET WEIGHT PING_IPS ENABLED
+    while read PROVIDER ETHERNET WEIGHT PING_IPS ENABLED; do
         local TABLE_NAME=${PROVIDER,,}
         if ! grep -wq "${TABLE_NAME}\$" <<<"$RT_TABLES"; then
             local RT_TABLE="/etc/iproute2/rt_tables.d/${TABLE_NAME}.conf"
@@ -115,7 +127,8 @@ vrf_dhclient() {
 # enslave interfaces to VRF
 migrate_to_vrf() {
     cmd_no_fail ip rule add l3mdev priority 1000
-    while read PROVIDER ETHERNET WEIGHT PING_IPS; do
+    local PROVIDER ETHERNET WEIGHT PING_IPS ENABLED
+    while read PROVIDER ETHERNET WEIGHT PING_IPS ENABLED; do
         local TABLE_NAME=${PROVIDER,,}
 
         # shutdown and clear interface
@@ -179,9 +192,10 @@ forward_and_masq() {
     if bool "$IPTABLES"; then
         # forwarding from iptables
         if [[ "$LAN_INT" ]]; then
-            IPTABLES_FORWARD=$(iptables -S | awk '/FORWARD/{ print $3 }')
-            cmd iptables -P FORWARD ACCEPT
+            cmd iptables -A FORWARD -s "$LAN_NET" -j ACCEPT
+            cmd iptables -A FORWARD -d "$LAN_NET" -j ACCEPT
             if bool "$IPV6"; then
+                # FIXME: find a way similar to IPv4 (source/destination)
                 IP6TABLES_FORWARD=$(ip6tables -S | awk '/FORWARD/{ print $3 }')
                 cmd ip6tables -P FORWARD ACCEPT
             fi
@@ -256,23 +270,26 @@ check_connectivity() {
 # VOID run(VOID): VOID
 # main function
 run() {
+    local PROVIDER ETHERNET WEIGHT PING_IPS ENABLED
     declare -A OLD_GATEWAY
     declare -A OLD_ROUTES
 
+    log "Run..."
     set_status 'RUNNING'
     while sleep $CHECK_INTERVAL; do
-        while read PROVIDER ETHERNET WEIGHT PING_IPS; do
+        while read PROVIDER ETHERNET WEIGHT PING_IPS ENABLED; do
             local TABLE_NAME=${PROVIDER,,}
             local ROUTES=$(ip -4 route show table "$TABLE_NAME")
             local GATEWAY=$(awk '/^default/{ print $3 }' <<<"$ROUTES")
             if [[ -z "$GATEWAY" ]]; then
                 # FIXME: sometimes the default gateway disappear... why?
+                warn "Default gateway ${OLD_GATEWAY[$PROVIDER]} no more present in ${PROVIDER} routes"
                 local LEASE_FILE="${RUNSTATEDIR}/dhclient.${ETHERNET}.leases"
                 local LEASE=$(get_last_lease "$LEASE_FILE")
                 local LEASE_OPTIONS=$(get_lease_options "$LEASE")
                 GATEWAY=$(awk -F= '/routers/{ print $2 }' <<<"$LEASE_OPTIONS")
                 [[ "$GATEWAY" != "${OLD_GATEWAY[$PROVIDER]}" || "$ROUTES" != "${OLD_ROUTES[$PROVIDER]}" ]] || continue
-                log "Reapply default route for ${PROVIDER} via ${GATEWAY}"
+                log "Try to apply dhcp lease default route for ${PROVIDER} via ${GATEWAY}"
                 if cmd_no_fatal ip route add default via "$GATEWAY" dev "$ETHERNET" table "$TABLE_NAME"; then
                     unset OLD_GATEWAY[$PROVIDER]
                     unset OLD_ROUTES[$PROVIDER]

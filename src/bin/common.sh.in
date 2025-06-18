@@ -49,6 +49,13 @@ test ! -t 1 || declare -A COLOR=(
 )
 
 
+# VOID stdout(ARGS*): VOID
+# stdout ARGS*
+stdout() {
+    echo -e "$@"
+}
+
+
 # VOID stderr(ARGS*): VOID
 # stderr ARGS*
 stderr() {
@@ -182,6 +189,7 @@ internal_error() {
     error "${_TRACEBACK[*]}"
     test $# -eq 1 || exit $_ERR
 }
+trap 'internal_error $?' ERR
 
 
 # INT cmd(CMD, ARGS*): VOID
@@ -253,10 +261,10 @@ trap_pid() {
 bool() {
     local VALUE="${1:-0}"
     case "${VALUE,,}" in
-        '1'|'yes'|'true') return 0 ;;
-        '0'|'no'|'false') return 1 ;;
-        *) fatal "Boolean value \`${VALUE}' not allowed" ;;
+        '1'|'yes'|'true'|'enabled') return 0 ;;
+        '0'|'no'|'false'|'disabled') return 1 ;;
     esac
+    fatal "Boolean value \`${VALUE}' not allowed"
 }
 
 
@@ -280,6 +288,20 @@ get_status() {
         cat "$STATUS_FILE"
     else
         echo 'STOPPED'
+    fi
+}
+
+
+# VOID get_pid([COMMAND]): PID
+# stdout PID for COMMAND (or self)
+get_pid() {
+    local COMMAND=${1:-$__COMMAND__}
+    local PID_FILE="${RUNSTATEDIR}/${COMMAND}.pid"
+
+    if [[ -f "$PID_FILE" ]]; then
+        cat "$PID_FILE"
+    elif [[ $# -eq 0 ]]; then
+        echo $$
     fi
 }
 
@@ -508,19 +530,42 @@ if_down() {
 }
 
 
-# VOID stdout_to_var(VAR, FUNCTION, ARGS*): VOID
-# store in VAR the stdout of FUNCTION(ARGS*) as an array of lines
-stdout_to_var() {
-    declare -n VAR="$1"
-    local FUNCTION="$2"
-    shift 2
+# VOID assign([OPTS*], VAR=FUNCTION, ARGS*): VOID
+# store in VAR the stdout of FUNCTION(ARGS*) using `read [OPTS*]`
+# to avoid subshell and preserve global variables
+assign() {
+    local -a OPTS
+    local NAME FUNCTION
+
+    while [[ "$1" == -? ]]; do
+        OPTS+=($1)
+        shift
+    done
+
+    if [[ "$1" == ?*=?* ]]; then
+        IFS='=' read NAME FUNCTION <<<"$1"
+        declare -n VAR="$NAME"
+        shift
+    else
+        internal_error 255 "assign $*"
+    fi
 
     # FIXME: https://www.reddit.com/r/bash/comments/135mdqt/no_redirect_to_variable/
     # Is there something better to avoid subshell and preserve variables changes?
     exec 4<><(:)
     { $FUNCTION "$@"; printf '\0'; } 1>&4
-    read -r -d '' -u 4 -a VAR
+    read -r -d '' -u 4 ${OPTS[@]} VAR
     exec 4>&-
+}
+
+
+# VOID load_conf(VOID): VOID
+# load config file by populating WAN_CONF and LAN_INT global variables
+load_conf() {
+    fatal "Config file \`${WAN_BALANCER_CONF}' not present" unless test -f "$WAN_BALANCER_CONF"
+    WAN_CONF=$(grep -vE '^$|^#|^LAN' "$WAN_BALANCER_CONF")
+    fatal "Config file \`${WAN_BALANCER_CONF}' is empty" when test -z "$WAN_CONF"
+    LAN_INT=$(awk '/^LAN[[:space:]]/{ print $2 }' "$WAN_BALANCER_CONF")
 }
 
 
@@ -528,7 +573,7 @@ stdout_to_var() {
 init() {
     # track errors with line and command
     set -o errtrace -o errexit -o pipefail -o functrace
-    trap 'internal_error $?' ERR
+    trap 'load_conf' HUP
 
     # enable tracing to file
     if [[ "$TRACE" ]]; then
@@ -560,11 +605,7 @@ init() {
         fatal 'Unsupported network configuration tool'
     fi
 
-    # load config file
-    fatal "Config file \`${WAN_BALANCER_CONF}' not present" unless test -f "$WAN_BALANCER_CONF"
-    WAN_CONF=$(grep -vE '^$|^#|^LAN' "$WAN_BALANCER_CONF")
-    fatal "Config file \`${WAN_BALANCER_CONF}' is empty" when test -z "$WAN_CONF"
-    LAN_INT=$(awk '/^LAN[[:space:]]/{ print $2 }' "$WAN_BALANCER_CONF")
+    load_conf
     if [[ "$LAN_INT" ]]; then
         LAN_NET=$(ip route show dev "$LAN_INT" scope link | awk '{ print $1 }')
         LAN_DNS=($(get_nameservers "$LAN_INT"))
